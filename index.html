@@ -1,0 +1,2712 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Desmos 贝塞尔渲染器</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23201d1d'/%3E%3C/svg%3E">
+<script src="https://www.desmos.com/api/v1.11/calculator.js?apiKey=dcb31709b452b1cf9dc26972add0fda6"
+        onload="window.__desmosLoaded = true"
+        onerror="window.__desmosFailed = true"></script>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden;
+    background: #fdfcfc; color: #201d1d;
+    /* CJK glyphs aren't in the mono faces above, so the browser falls
+       through to whatever the platform substitutes -- PingFang SC keeps
+       that fallback a real (already-installed, no external font) CJK
+       face instead of an inconsistent system default. */
+    font-family: "Berkeley Mono", "JetBrains Mono", "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace;
+  }
+  body { display: flex; flex-direction: column; }
+
+  #toolbar {
+    flex: 0 0 auto;
+    min-height: 56px;
+    display: flex; align-items: center; flex-wrap: wrap; gap: 10px 20px;
+    padding: 10px 16px;
+    background: #fdfcfc;
+    border-bottom: 1px solid rgba(15,0,0,0.12);
+    font-size: 14px; line-height: 1.3;
+  }
+  #wordmark { display: flex; align-items: center; flex: 0 0 auto; }
+  #wordmark svg { display: block; }
+  #controls { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  #toolbar label { display: flex; align-items: center; gap: 6px; white-space: nowrap; color: #646262; }
+  #toolbar input[type="range"] { width: 90px; vertical-align: middle; accent-color: #201d1d; }
+  #toolbar .val { color: #201d1d; font-variant-numeric: tabular-nums; }
+
+  #fileLabel, #renderBtn, #drawBtn, #fillToggleBtn, #fourierToggleBtn, #fineFillBtn {
+    cursor: pointer; font-family: inherit;
+    height: 36px; padding: 4px 20px;
+    display: inline-flex; align-items: center;
+    border: none; border-radius: 4px;
+    background: #201d1d; color: #fdfcfc;
+    font-weight: 500; font-size: 14px;
+  }
+  #fileLabel:hover, #renderBtn:hover, #drawBtn:hover { background: #424245; }
+  #renderBtn:disabled, #drawBtn:disabled { background: #9a9898; cursor: not-allowed; }
+  #fileInput { display: none; }
+  /* Toggle, not an action button: pressed (on) matches the solid primary
+     style; unpressed (off) hollows out to signal "inactive" without a
+     second color vocabulary. */
+  #fillToggleBtn, #fourierToggleBtn, #fineFillBtn { border: 1px solid #201d1d; }
+  #fillToggleBtn[aria-pressed="false"], #fourierToggleBtn[aria-pressed="false"], #fineFillBtn[aria-pressed="false"] { background: #fdfcfc; color: #201d1d; }
+  #fillToggleBtn[aria-pressed="false"]:hover, #fourierToggleBtn[aria-pressed="false"]:hover, #fineFillBtn[aria-pressed="false"]:hover { background: rgba(32,29,29,0.06); }
+  #fillToggleBtn[aria-pressed="true"]:hover, #fourierToggleBtn[aria-pressed="true"]:hover, #fineFillBtn[aria-pressed="true"]:hover { background: #424245; }
+
+  #hint { color: #9a9898; }
+
+  #stats { margin-left: auto; color: #646262; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #stats.err { color: #ff3b30; }
+  #stats .cap { color: #ff9f0a; }
+
+  #main { position: relative; flex: 1 1 auto; min-height: 0; background: #fdfcfc; }
+  #calculator { position: absolute; inset: 0; z-index: 1; background: #fdfcfc; }
+  /* Draw-in animation overlay: shares #calculator's own inset:0 origin, so
+     Desmos's graphpaperBounds.pixelCoordinates map onto it with no extra
+     offset math. pointer-events:none keeps the real Desmos underneath
+     interactive (pan/zoom) throughout the animation. */
+  /* width/height 100% is REQUIRED: canvas is a replaced element, so inset:0
+     alone does NOT stretch it — with auto size it renders at its (dpr-scaled)
+     bitmap size, doubling all stroke positions on Retina (dpr=2) displays. */
+  #drawOverlay { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 2; pointer-events: none; display: none; }
+
+  #dropOverlay {
+    position: fixed; inset: 0; z-index: 30; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(32,29,29,0.04);
+    pointer-events: none;
+  }
+  #dropOverlay span {
+    font-size: 18px; font-weight: 700; color: #201d1d;
+    background: #fdfcfc; border: 1px solid rgba(15,0,0,0.12);
+    padding: 16px 28px; border-radius: 0;
+  }
+  body.dragging #dropOverlay { display: flex; }
+
+  #previewWrap {
+    position: absolute; z-index: 15;
+    right: 12px; bottom: 12px;
+    width: 220px;
+    background: #fdfcfc; border: 1px solid rgba(15,0,0,0.12); border-radius: 0;
+    overflow: hidden;
+  }
+  #previewWrap canvas { display: block; width: 100%; height: auto; background: #fdfcfc; }
+  .previewCaption { font-size: 14px; color: #646262; padding: 6px 8px; }
+  /* hairline separators: canvas→caption inside source, section→section, caption→canvas inside curve */
+  #sourceCanvas + .previewCaption { border-top: 1px solid rgba(15,0,0,0.12); }
+  #sourceSection:not([hidden]) + #curveSection { border-top: 1px solid rgba(15,0,0,0.12); }
+  #curveSection #previewCanvas { border-top: 1px solid rgba(15,0,0,0.12); }
+  #curveCaption { cursor: pointer; user-select: none; }
+  #curveCaption:hover { color: #201d1d; }
+  #curveSection.collapsed #previewCanvas { display: none; }
+  #desmosNotice { display: none; color: #ff3b30; font-size: 14px; padding: 8px 8px 0 8px; }
+
+  #previewWrap.large {
+    inset: 0; width: auto;
+    display: flex; flex-direction: column;
+  }
+  #previewWrap.large #sourceSection { display: none; }
+  #previewWrap.large #curveSection {
+    flex: 1; min-height: 0;
+    display: flex; flex-direction: column;
+  }
+  #previewWrap.large #curveSection #previewCanvas {
+    display: block; flex: 1; min-height: 0;
+    width: 100%; height: 100%; object-fit: contain;
+  }
+  #previewWrap.large #desmosNotice { display: block; }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <div id="wordmark"></div>
+  <div id="controls">
+    <label id="fileLabel" for="fileInput">选择图片
+      <input id="fileInput" type="file" accept="image/*">
+    </label>
+    <span id="hint">[+] 拖入图片即可</span>
+
+    <label>阈值
+      <input id="thresholdSlider" type="range" min="10" max="300" step="1" value="60">
+      <span class="val">[<span id="thresholdVal">60</span>]</span>
+    </label>
+
+    <label id="toleranceLabel">容差
+      <input id="toleranceSlider" type="range" min="0.3" max="10" step="0.1" value="2.0">
+      <span class="val">[<span id="toleranceVal">2.0</span>]</span>
+    </label>
+
+    <label id="harmonicsLabel" hidden>谐波数
+      <input id="harmonicsSlider" type="range" min="4" max="120" step="1" value="40">
+      <span class="val">[<span id="harmonicsVal">40</span>]</span>
+    </label>
+
+    <label>曲线上限
+      <input id="maxCurvesSlider" type="range" min="100" max="8000" step="100" value="4000">
+      <span class="val">[<span id="maxCurvesVal">4000</span>]</span>
+    </label>
+
+    <label>绘制速度
+      <input id="speedSlider" type="range" min="0.25" max="4" step="0.25" value="1">
+      <span class="val">[<span id="speedVal">1.0</span>x]</span>
+    </label>
+
+    <button id="fillToggleBtn" aria-pressed="true">[*] 填色</button>
+    <button id="fineFillBtn" aria-pressed="false">[#] 精细</button>
+    <button id="fourierToggleBtn" aria-pressed="false">[~] 傅里叶</button>
+    <button id="renderBtn" disabled>渲染</button>
+    <button id="drawBtn" disabled>[&gt;] 绘制</button>
+  </div>
+
+  <span id="stats">[+] 先载入一张图片</span>
+</div>
+
+<div id="main">
+  <div id="calculator"></div>
+  <canvas id="drawOverlay"></canvas>
+
+  <div id="previewWrap" hidden>
+    <div id="desmosNotice">[x] Desmos 加载失败(网络被拦截?)— 已切换到离线画布预览。</div>
+    <div class="previewSection" id="sourceSection" hidden>
+      <canvas id="sourceCanvas" width="220" height="150"></canvas>
+      <div class="previewCaption">图 1. 原图</div>
+    </div>
+    <div class="previewSection collapsed" id="curveSection">
+      <div class="previewCaption" id="curveCaption"><span id="curveMarker">[+]</span> 图 2. 拟合曲线</div>
+      <canvas id="previewCanvas" width="220" height="150"></canvas>
+    </div>
+  </div>
+</div>
+
+<div id="dropOverlay"><span>[+] 拖入图片即可</span></div>
+
+<script>
+'use strict';
+
+/* =========================================================================
+ * PURE PIPELINE — grayscale -> blur -> Canny -> contour trace -> RDP ->
+ * Schneider fitCurve (Graphics Gems cubic Bézier fitting). No DOM/canvas
+ * references below this line except plain typed arrays in, typed arrays out.
+ * Verified against a Node.js smoke test (circle image + synthetic paths)
+ * before being embedded here.
+ * ========================================================================= */
+
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+function toGrayscale(data, width, height) {
+  const gray = new Float32Array(width * height);
+  for (let i = 0, p = 0; p < width * height; i += 4, p++) {
+    gray[p] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+  }
+  return gray;
+}
+
+const GAUSS_KERNEL = [2,4,5,4,2, 4,9,12,9,4, 5,12,15,12,5, 4,9,12,9,4, 2,4,5,4,2];
+const GAUSS_SUM = 159;
+
+function gaussianBlur5(gray, width, height) {
+  const out = new Float32Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      let sum = 0, k = 0;
+      for (let ky = -2; ky <= 2; ky++) {
+        const sy = clamp(y + ky, 0, height - 1);
+        for (let kx = -2; kx <= 2; kx++) {
+          const sx = clamp(x + kx, 0, width - 1);
+          sum += gray[sy * width + sx] * GAUSS_KERNEL[k++];
+        }
+      }
+      out[y * width + x] = sum / GAUSS_SUM;
+    }
+  }
+  return out;
+}
+
+const SOBEL_GX = [-1,0,1,-2,0,2,-1,0,1];
+const SOBEL_GY = [-1,-2,-1,0,0,0,1,2,1];
+
+function sobel(gray, width, height) {
+  const mag = new Float32Array(width * height);
+  const dir = new Float32Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      let gx = 0, gy = 0, k = 0;
+      for (let ky = -1; ky <= 1; ky++) {
+        const sy = clamp(y + ky, 0, height - 1);
+        for (let kx = -1; kx <= 1; kx++) {
+          const sx = clamp(x + kx, 0, width - 1);
+          const v = gray[sy * width + sx];
+          gx += v * SOBEL_GX[k];
+          gy += v * SOBEL_GY[k];
+          k++;
+        }
+      }
+      const idx = y * width + x;
+      mag[idx] = Math.sqrt(gx * gx + gy * gy);
+      dir[idx] = Math.atan2(gy, gx);
+    }
+  }
+  return { mag, dir };
+}
+
+function sampleBilinear(mag, width, height, x, y) {
+  const x0 = Math.floor(x), y0 = Math.floor(y);
+  const fx = x - x0, fy = y - y0;
+  function at(xi, yi) {
+    const cx = clamp(xi, 0, width - 1), cy = clamp(yi, 0, height - 1);
+    return mag[cy * width + cx];
+  }
+  const v00 = at(x0, y0), v10 = at(x0 + 1, y0), v01 = at(x0, y0 + 1), v11 = at(x0 + 1, y0 + 1);
+  const top = v00 * (1 - fx) + v10 * fx;
+  const bottom = v01 * (1 - fx) + v11 * fx;
+  return top * (1 - fy) + bottom * fy;
+}
+
+// Sub-pixel NMS (improved-Canny formulation): instead of snapping the gradient
+// direction to one of 4 discrete bins (0/45/90/135deg), interpolate the magnitude
+// at the two neighbors that sit exactly along the true continuous gradient angle.
+// This avoids the direction-quantization error that fragmented long, gently-curving
+// edges (e.g. a circle) into short segments at non-45deg-multiple angles.
+function nonMaxSuppression(mag, dir, width, height) {
+  const out = new Float32Array(width * height);
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const idx = y * width + x;
+      const m = mag[idx];
+      if (m === 0) continue;
+      const angle = dir[idx];
+      const dx = Math.cos(angle), dy = Math.sin(angle);
+      const mag1 = sampleBilinear(mag, width, height, x + dx, y + dy);
+      const mag2 = sampleBilinear(mag, width, height, x - dx, y - dy);
+      out[idx] = (m >= mag1 && m >= mag2) ? m : 0;
+    }
+  }
+  return out;
+}
+
+function doubleThresholdHysteresis(nms, width, height, high, low) {
+  const STRONG = 2, WEAK = 1;
+  const classification = new Uint8Array(width * height);
+  for (let i = 0; i < nms.length; i++) {
+    if (nms[i] >= high) classification[i] = STRONG;
+    else if (nms[i] >= low) classification[i] = WEAK;
+  }
+  const edge = new Uint8Array(width * height);
+  const stack = [];
+  for (let i = 0; i < classification.length; i++) {
+    if (classification[i] === STRONG) { edge[i] = 255; stack.push(i); }
+  }
+  while (stack.length) {
+    const idx = stack.pop();
+    const x = idx % width, y = (idx / width) | 0;
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        if (dx === 0 && dy === 0) continue;
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+        const nidx = ny * width + nx;
+        if (classification[nidx] === WEAK && edge[nidx] === 0) {
+          edge[nidx] = 255;
+          stack.push(nidx);
+        }
+      }
+    }
+  }
+  return edge;
+}
+
+// Guo-Hall morphological thinning: reduces a possibly multi-pixel-wide
+// binary edge map to a 1-pixel-wide skeleton while preserving connectivity
+// and endpoints. Tried Zhang-Suen first (the more commonly cited algorithm),
+// but it has a documented blind spot on diagonal staircase patterns: NMS
+// doesn't perfectly localize a ~45deg edge to a single-pixel ridge (its
+// gradient-direction quantization has only 4 bins), leaving a residual
+// double ridge one pixel apart, and Zhang-Suen's connectivity-preservation
+// conditions can let both parallel pixels simultaneously "prove" they're
+// each safe to keep, converging with 2x2 blocks or diagonally-doubled
+// pixels still present. Patching that (detect+break 2x2 blocks, re-converge)
+// helped but didn't fully clear it — the residual pattern isn't always an
+// axis-aligned square. Guo-Hall uses a different per-pixel deletion rule (a
+// connectivity number N distinct from Zhang-Suen's crossing-number A/B pair)
+// that specifically avoids this failure mode on diagonal lines. This
+// directly removes the root cause of the contour-tracer "knot" bug: once a
+// thick stroke's inner and outer Canny edges are thinned to a single 1px
+// centerline, they can no longer be 8-connected to each other, so the
+// tracer never has a wrong-ring pixel to jump onto in the first place.
+function guoHallThin(edge, width, height) {
+  const img = new Uint8Array(width * height);
+  for (let i = 0; i < edge.length; i++) img[i] = edge[i] === 255 ? 1 : 0;
+
+  function get(x, y) {
+    if (x < 0 || x >= width || y < 0 || y >= height) return 0;
+    return img[y * width + x];
+  }
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let iter = 0; iter < 2; iter++) {
+      const toRemove = [];
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          if (!get(x, y)) continue;
+          const p2 = get(x, y - 1), p3 = get(x + 1, y - 1), p4 = get(x + 1, y),
+                p5 = get(x + 1, y + 1), p6 = get(x, y + 1), p7 = get(x - 1, y + 1),
+                p8 = get(x - 1, y), p9 = get(x - 1, y - 1);
+
+          const C = ((p2 ? 0 : 1) & (p3 | p4)) + ((p4 ? 0 : 1) & (p5 | p6)) +
+                    ((p6 ? 0 : 1) & (p7 | p8)) + ((p8 ? 0 : 1) & (p9 | p2));
+          if (C !== 1) continue;
+
+          const N1 = (p9 | p2) + (p3 | p4) + (p5 | p6) + (p7 | p8);
+          const N2 = (p2 | p3) + (p4 | p5) + (p6 | p7) + (p8 | p9);
+          const N = Math.min(N1, N2);
+          if (N < 2 || N > 3) continue;
+
+          const m = iter === 0 ? ((p6 | p7 | (p9 ? 0 : 1)) & p8) : ((p2 | p3 | (p5 ? 0 : 1)) & p4);
+          if (m !== 0) continue;
+
+          toRemove.push(y * width + x);
+        }
+      }
+      if (toRemove.length) {
+        changed = true;
+        for (const idx of toRemove) img[idx] = 0;
+      }
+    }
+  }
+
+  const out = new Uint8Array(width * height);
+  for (let i = 0; i < img.length; i++) out[i] = img[i] ? 255 : 0;
+  return out;
+}
+
+function traceContours(edge, width, height, minLength) {
+  const visited = new Uint8Array(width * height);
+  const paths = [];
+  const NB = [[1,0],[1,1],[0,1],[-1,1],[-1,0],[-1,-1],[0,-1],[1,-1]];
+  // Directional momentum, smoothed over several steps rather than judged from
+  // only the single last step. A thick stroke's inner and outer Canny edges
+  // run parallel and interleaved at diagonal (e.g. 45 deg) staircase
+  // segments — there, a wrong jump onto the neighboring ring is *also*
+  // forward-looking relative to the immediately preceding single-pixel step
+  // (pixel-level staircase noise makes the two indistinguishable one step at
+  // a time), so comparing against only the last step still zigzags ("knot")
+  // between the two rings. Averaging the heading over several steps filters
+  // out that per-pixel noise: the true continuation keeps tracking the
+  // smoothed trend, while a lateral jump to the other ring stands out as an
+  // off-trend outlier and scores worse.
+  const MOMENTUM_ALPHA = 0.35;
+  // Stepping into a pixel already surrounded by several visited pixels is a
+  // second, independent tell that we're diving into an already-traced
+  // tangle rather than extending the frontier — penalize it directly.
+  const DENSITY_PENALTY = 1.2;
+
+  function isEdge(x, y) {
+    return x >= 0 && x < width && y >= 0 && y < height && edge[y * width + x] === 255;
+  }
+
+  function visitedNeighborCount(x, y) {
+    let c = 0;
+    for (let k = 0; k < 8; k++) {
+      const nx = x + NB[k][0], ny = y + NB[k][1];
+      if (nx >= 0 && nx < width && ny >= 0 && ny < height && visited[ny * width + nx]) c++;
+    }
+    return c;
+  }
+
+  function walk(startX, startY) {
+    const pts = [];
+    let cx = startX, cy = startY;
+    let avgDx = 0, avgDy = 0; // no established heading yet at the start of a walk
+    while (true) {
+      let bestX = -1, bestY = -1, bestDx = 0, bestDy = 0, bestScore = -Infinity;
+      const avgLen = Math.hypot(avgDx, avgDy);
+      for (let k = 0; k < 8; k++) {
+        const dx = NB[k][0], dy = NB[k][1];
+        const nx = cx + dx, ny = cy + dy;
+        if (!isEdge(nx, ny) || visited[ny * width + nx]) continue;
+        const align = avgLen < 1e-9 ? 0 : (dx * avgDx + dy * avgDy) / (Math.hypot(dx, dy) * avgLen);
+        const score = align - DENSITY_PENALTY * visitedNeighborCount(nx, ny);
+        if (score > bestScore) {
+          bestScore = score; bestX = nx; bestY = ny; bestDx = dx; bestDy = dy;
+        }
+      }
+      if (bestX < 0) break;
+      visited[bestY * width + bestX] = 1;
+      pts.push([bestX, bestY]);
+      cx = bestX; cy = bestY;
+      avgDx = avgDx * (1 - MOMENTUM_ALPHA) + bestDx * MOMENTUM_ALPHA;
+      avgDy = avgDy * (1 - MOMENTUM_ALPHA) + bestDy * MOMENTUM_ALPHA;
+    }
+    return pts;
+  }
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = y * width + x;
+      if (edge[idx] === 255 && !visited[idx]) {
+        visited[idx] = 1;
+        const forward = walk(x, y);
+        const backward = walk(x, y);
+        const full = backward.reverse().concat([[x, y]]).concat(forward);
+        let len = 0;
+        for (let i = 1; i < full.length; i++) {
+          len += Math.hypot(full[i][0] - full[i - 1][0], full[i][1] - full[i - 1][1]);
+        }
+        if (len >= minLength) paths.push(full);
+      }
+    }
+  }
+  return paths;
+}
+
+// Soft/anti-aliased art (pastel line art, low-contrast photos) produces a
+// Canny edge map that LOOKS continuous but is riddled with tiny 1-3px
+// pixel-level gaps: measured on a real pastel test image, 90% of traced-path
+// endpoints have another path's endpoint within 6px. NMS's per-pixel local-
+// max decision is inherently noisy where the gradient ridge is broad and
+// shallow, so it flickers on/off along an otherwise-real contour instead of
+// cleanly missing it outright — raising or lowering the absolute hysteresis
+// threshold does not fix this (verified empirically: sweeping high=10..60
+// left the median connected-component size at 1px throughout), because the
+// missing pixels aren't simply "below threshold", they're scattered
+// individual suppressions. The fix is downstream: re-link path endpoints
+// that are close together and pointing at each other, the same way a human
+// eye bridges a small gap when reading the line art.
+function pathTangentOutward(path, atStart) {
+  const n = path.length;
+  if (n < 2) return [0, 0];
+  const anchorIdx = atStart ? 0 : n - 1;
+  const dir = atStart ? 1 : -1;
+  const anchor = path[anchorIdx];
+  const totalSpan = Math.hypot(path[0][0] - path[n - 1][0], path[0][1] - path[n - 1][1]) || 1;
+  const minDist = Math.max(1.5, totalSpan * 0.05);
+  let target = path[anchorIdx + dir];
+  let i = anchorIdx + dir;
+  while (i >= 0 && i < n) {
+    target = path[i];
+    if (Math.hypot(target[0] - anchor[0], target[1] - anchor[1]) >= minDist) break;
+    i += dir;
+  }
+  const inward = [target[0] - anchor[0], target[1] - anchor[1]];
+  const len = Math.hypot(inward[0], inward[1]) || 1;
+  return [-inward[0] / len, -inward[1] / len];
+}
+
+function linkPathGaps(paths, maxGapDist, maxAngleDeg, width, height) {
+  const cosThreshold = Math.cos((maxAngleDeg * Math.PI) / 180);
+  let chains = paths.filter((p) => p.length >= 2).map((p) => p.slice());
+  const hasOwnerGrid = !!(width && height);
+
+  // Ownership grid: which chain (if any) each pixel belongs to. Used to
+  // reject a candidate bridge that would jump over a THIRD, unrelated
+  // chain's pixels — e.g. two nearby strokes on either side of a letter or
+  // an unrelated line that happen to point at each other. A true gap (NMS/
+  // hysteresis noise breaking one real contour) has nothing but background
+  // in between; bridging across other content is exactly the failure mode
+  // that made dense, high-contrast images (reference.png) over-merge even
+  // once the tangent-alignment check above was fixed. Rebuilt fresh every
+  // outer iteration (see below) since `chains` gets re-indexed by the
+  // end-of-iteration filter — a grid built against old indices would mislabel
+  // pixels after that reindex.
+  //
+  // Tried relaxing this for thick-stroke line art (two parallel Canny
+  // boundaries a few px apart, one always "in the way" of healing a gap in
+  // the other): only reject blockers that cross the bridge transversely,
+  // allow ones running parallel through. Measured rejection rate did drop
+  // (90% -> ~70-80% depending on angle threshold), but median path length on
+  // the thick-stroke test barely moved (1.0-1.06x, nowhere near the 3x
+  // needed) while test-shapes.png and demo-dragon.png picked up real,
+  // fast-escalating regressions (test-shapes +5% at a strict 15deg
+  // threshold, +19% by 20deg) — the relaxation loosens acceptance broadly,
+  // not just for the companion-edge case it targeted. Reverted; root cause
+  // for thick strokes is upstream of gap-linking (see progress notes).
+  let owner = null;
+  function rebuildOwnerGrid() {
+    if (!hasOwnerGrid) return;
+    owner = new Int32Array(width * height).fill(-1);
+    for (let ci = 0; ci < chains.length; ci++) {
+      if (!chains[ci]) continue;
+      for (const [x, y] of chains[ci]) {
+        const xi = Math.round(x), yi = Math.round(y);
+        if (xi >= 0 && xi < width && yi >= 0 && yi < height) owner[yi * width + xi] = ci;
+      }
+    }
+  }
+
+  function bridgeIsClear(ax, ay, bx, by, chainA, chainB) {
+    if (!owner) return true;
+    const dist = Math.hypot(bx - ax, by - ay);
+    const steps = Math.max(1, Math.ceil(dist));
+    for (let s = 1; s < steps; s++) {
+      const t = s / steps;
+      const x = Math.round(ax + (bx - ax) * t), y = Math.round(ay + (by - ay) * t);
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+          const o = owner[ny * width + nx];
+          if (o >= 0 && o !== chainA && o !== chainB) return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  function endpointsOf(chain) {
+    return {
+      start: { pt: chain[0], dir: pathTangentOutward(chain, true) },
+      end: { pt: chain[chain.length - 1], dir: pathTangentOutward(chain, false) },
+    };
+  }
+
+  let merged = true;
+  let iterations = 0;
+  const MAX_ITERATIONS = 6;
+  while (merged && iterations < MAX_ITERATIONS) {
+    merged = false;
+    iterations++;
+    rebuildOwnerGrid();
+    const cellSize = Math.max(4, maxGapDist);
+    const cellKey = (x, y) => Math.floor(x / cellSize) + ',' + Math.floor(y / cellSize);
+    const grid = new Map();
+    const endpointList = [];
+    for (let ci = 0; ci < chains.length; ci++) {
+      if (!chains[ci]) continue;
+      const eps = endpointsOf(chains[ci]);
+      endpointList.push({ chainIdx: ci, which: 'start', pt: eps.start.pt, dir: eps.start.dir });
+      endpointList.push({ chainIdx: ci, which: 'end', pt: eps.end.pt, dir: eps.end.dir });
+    }
+    for (const e of endpointList) {
+      const k = cellKey(e.pt[0], e.pt[1]);
+      if (!grid.has(k)) grid.set(k, []);
+      grid.get(k).push(e);
+    }
+
+    const usedChains = new Set();
+    for (const e of endpointList) {
+      if (usedChains.has(e.chainIdx) || !chains[e.chainIdx]) continue;
+      const cx = Math.floor(e.pt[0] / cellSize), cy = Math.floor(e.pt[1] / cellSize);
+      let best = null, bestDist = Infinity;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const bucket = grid.get((cx + dx) + ',' + (cy + dy));
+          if (!bucket) continue;
+          for (const o of bucket) {
+            if (o.chainIdx === e.chainIdx || usedChains.has(o.chainIdx)) continue;
+            const dist = Math.hypot(o.pt[0] - e.pt[0], o.pt[1] - e.pt[1]);
+            if (dist < 1e-6) continue;
+            if (dist > maxGapDist) continue;
+            // Two checks, not one: it's not enough for the two tangents to be
+            // mutually opposite — two nearby PARALLEL-but-unrelated strokes
+            // (e.g. adjacent hair strands both pointing "up") satisfy that
+            // alone. The gap vector itself must continue each endpoint's own
+            // tangent, i.e. extending A forward must actually head toward B,
+            // and extending B forward must head back toward A — not just
+            // "some direction opposite of the other one". Verified this was
+            // the actual cause of over-merging on dense, high-contrast images
+            // (reference.png curve count blew up 3-4x on the tangent-only
+            // check, even at a conservative few-px gap distance).
+            const gx = (o.pt[0] - e.pt[0]) / dist, gy = (o.pt[1] - e.pt[1]) / dist;
+            const alignE = e.dir[0] * gx + e.dir[1] * gy;
+            const alignO = o.dir[0] * -gx + o.dir[1] * -gy;
+            if (alignE < cosThreshold || alignO < cosThreshold) continue;
+            if (!bridgeIsClear(e.pt[0], e.pt[1], o.pt[0], o.pt[1], e.chainIdx, o.chainIdx)) continue;
+            if (dist < bestDist) { bestDist = dist; best = o; }
+          }
+        }
+      }
+      if (best) {
+        let A = chains[e.chainIdx], B = chains[best.chainIdx];
+        if (e.which === 'start') A = A.slice().reverse();
+        if (best.which === 'end') B = B.slice().reverse();
+        chains[e.chainIdx] = A.concat(B);
+        chains[best.chainIdx] = null;
+        usedChains.add(e.chainIdx);
+        usedChains.add(best.chainIdx);
+        merged = true;
+      }
+    }
+    chains = chains.filter((c) => c !== null);
+  }
+  return chains;
+}
+
+function rdpSimplify(points, epsilon) {
+  if (points.length < 3) return points.slice();
+  function perpendicularDistance(p, a, b) {
+    const dx = b[0] - a[0], dy = b[1] - a[1];
+    const len = Math.hypot(dx, dy);
+    if (len === 0) return Math.hypot(p[0] - a[0], p[1] - a[1]);
+    return Math.abs(dy * p[0] - dx * p[1] + b[0] * a[1] - b[1] * a[0]) / len;
+  }
+  const keep = new Uint8Array(points.length);
+  keep[0] = 1; keep[points.length - 1] = 1;
+  const stack = [[0, points.length - 1]];
+  while (stack.length) {
+    const [start, end] = stack.pop();
+    if (end <= start + 1) continue;
+    let maxDist = 0, index = -1;
+    for (let i = start + 1; i < end; i++) {
+      const d = perpendicularDistance(points[i], points[start], points[end]);
+      if (d > maxDist) { maxDist = d; index = i; }
+    }
+    if (maxDist > epsilon && index !== -1) {
+      keep[index] = 1;
+      stack.push([start, index]);
+      stack.push([index, end]);
+    }
+  }
+  const out = [];
+  for (let i = 0; i < points.length; i++) if (keep[i]) out.push(points[i]);
+  return out;
+}
+
+/* =========================================================================
+ * Fourier mode (傅里叶模式) pure functions: uniform arc-length resampling ->
+ * open-path mirror-closing -> complex DFT -> top-N-by-magnitude harmonic
+ * truncation -> reconstruction. Operates on the SAME pixel-level paths the
+ * Bezier branch consumes (post trace + gap-link + minLength filter, pre-RDP)
+ * -- see the branch point in render(). Verified against a Node smoke test
+ * (circle/square/zigzag synthetic paths + a coefficient-space y-flip
+ * identity) before being embedded here.
+ * ========================================================================= */
+
+function pathArcLength(points) {
+  let l = 0;
+  for (let i = 1; i < points.length; i++) {
+    l += Math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1]);
+  }
+  return l;
+}
+
+// Uniform arc-length resampling: M points including both endpoints exactly
+// (fraction i/(M-1) of total arc length).
+function resamplePathUniform(points, M) {
+  if (points.length < 2 || M < 2) return points.slice();
+  const cum = [0];
+  for (let i = 1; i < points.length; i++) {
+    cum.push(cum[i - 1] + Math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1]));
+  }
+  const total = cum[cum.length - 1];
+  const out = [];
+  if (total === 0) {
+    for (let i = 0; i < M; i++) out.push(points[0].slice());
+    return out;
+  }
+  let seg = 1;
+  for (let i = 0; i < M; i++) {
+    const target = (i / (M - 1)) * total;
+    while (seg < cum.length - 1 && cum[seg] < target) seg++;
+    const segStart = cum[seg - 1], segEnd = cum[seg];
+    const t = segEnd > segStart ? (target - segStart) / (segEnd - segStart) : 0;
+    const a = points[seg - 1], b = points[seg];
+    out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+  }
+  return out;
+}
+
+function isPathClosed(points, closeThresholdPx) {
+  const a = points[0], b = points[points.length - 1];
+  return Math.hypot(a[0] - b[0], a[1] - b[1]) <= closeThresholdPx;
+}
+
+// Adaptive sample count (power of 2): enough points to resolve detail on
+// long paths, capped so short paths don't over-sample or blow up harmonic
+// count relative to path complexity.
+function chooseResampleCount(arcLength) {
+  let M = 32;
+  while (M < arcLength && M < 512) M *= 2;
+  return M;
+}
+
+// Forth-and-back mirror close for an open path: append the reverse of the
+// interior points (both endpoints excluded, which would otherwise
+// duplicate) so the sequence returns to its start with no jump
+// discontinuity -- a hard jump is exactly what would blow up a DFT
+// truncated to a handful of harmonics into severe Gibbs ringing. Length is
+// 2*M-2 for an M-point input. The animation only traces the FIRST half
+// (t in [0, M/L]); the second half retraces the same path in reverse over
+// already-drawn ink, so tMax below deliberately stops there rather than at 1.
+function mirrorClosePath(resampled) {
+  const M = resampled.length;
+  if (M < 2) return resampled.slice();
+  const back = resampled.slice(1, M - 1).slice().reverse();
+  return resampled.concat(back);
+}
+
+// Complex DFT: z_k = x_k + i*y_k, k=0..L-1. Returns L coefficients
+// c_n = (1/L) * sum_k z_k * exp(-i*2*pi*n*k/L), each tagged with its SIGNED
+// frequency n in (-L/2, L/2] (folding the upper half of the raw 0..L-1 index
+// range to negative frequencies) -- z(t) is complex-valued (not a real
+// signal), so both positive and negative frequencies carry independent
+// information and both must be kept, unlike a real-valued FFT's conjugate
+// symmetry shortcut.
+function complexDFT(points) {
+  const L = points.length;
+  const coeffs = [];
+  for (let rawN = 0; rawN < L; rawN++) {
+    const n = rawN <= L / 2 ? rawN : rawN - L;
+    let re = 0, im = 0;
+    for (let k = 0; k < L; k++) {
+      const angle = (-2 * Math.PI * rawN * k) / L;
+      const c = Math.cos(angle), s = Math.sin(angle);
+      const zx = points[k][0], zy = points[k][1];
+      re += zx * c - zy * s;
+      im += zx * s + zy * c;
+    }
+    coeffs.push({ n, re: re / L, im: im / L });
+  }
+  return coeffs;
+}
+
+// DC (n=0, path centroid) is kept separately and always retained regardless
+// of N; the top N remaining coefficients by magnitude |c_n| are kept as
+// {n, mag, phase} (phase = arg(c_n)), which is the form the epicycle
+// animation and the Desmos cos/sin latex both consume directly.
+function topHarmonics(coeffs, N) {
+  let dc = { re: 0, im: 0 };
+  const rest = [];
+  for (const c of coeffs) {
+    if (c.n === 0) { dc = c; continue; }
+    rest.push(c);
+  }
+  rest.sort((a, b) => Math.hypot(b.re, b.im) - Math.hypot(a.re, a.im));
+  const kept = rest.slice(0, N).map((c) => ({
+    n: c.n,
+    mag: Math.hypot(c.re, c.im),
+    phase: Math.atan2(c.im, c.re),
+  }));
+  return { dc: [dc.re, dc.im], harmonics: kept };
+}
+
+// x(t) = a0 + sum R_n*cos(2*pi*n*t + P_n); y(t) = b0 + sum R_n*sin(2*pi*n*t + P_n).
+// Same closed form the Desmos latex and the epicycle chain both evaluate.
+function reconstructPoint(dc, harmonics, t) {
+  let x = dc[0], y = dc[1];
+  for (const h of harmonics) {
+    const theta = 2 * Math.PI * h.n * t + h.phase;
+    x += h.mag * Math.cos(theta);
+    y += h.mag * Math.sin(theta);
+  }
+  return [x, y];
+}
+
+function reconstructPath(dc, harmonics, count, tMax) {
+  const out = [];
+  const max = tMax === undefined ? 1 : tMax;
+  for (let i = 0; i <= count; i++) out.push(reconstructPoint(dc, harmonics, (i / count) * max));
+  return out;
+}
+
+// Transform a (dc, harmonics) pair computed in pixel space (y grows downward)
+// into the equivalent pair for y-flipped math space (new_y = height - old_y),
+// without re-running the DFT. Derivation: z(t)=x(t)+i*y(t); flipping y gives
+// new_z(t) = x(t) - i*y(t) + i*height = conj(z(t)) + i*height. Since
+// z(t) = sum_n c_n*exp(i*2*pi*n*t), conjugating maps c_n to conj(c_n) at
+// frequency -n (same magnitude, negated phase); the added i*height term only
+// shifts the DC term's y-component. Verified numerically against a direct
+// flip-then-DFT on synthetic paths (agrees to float noise, ~1e-12px).
+function flipHarmonicsY(dc, harmonics, height) {
+  const newDc = [dc[0], height - dc[1]];
+  const newHarmonics = harmonics.map((h) => ({ n: -h.n, mag: h.mag, phase: -h.phase }));
+  return { dc: newDc, harmonics: newHarmonics };
+}
+
+// Epicycle chain at parameter t: cumulative sum of rotating vectors, ordered
+// by |n| ascending (slow big loops innermost, fast small loops outermost --
+// the classic 3Blue1Brown convention). Each segment is a circle
+// (centerX,centerY,r) with a spoke to (tipX,tipY); the final tip is exactly
+// reconstructPoint(dc, harmonics, t) (verified in the Node smoke test).
+function epicycleChain(dc, harmonics, t) {
+  const sorted = harmonics.slice().sort((a, b) => Math.abs(a.n) - Math.abs(b.n));
+  let cx = dc[0], cy = dc[1];
+  const segments = [];
+  for (const h of sorted) {
+    const theta = 2 * Math.PI * h.n * t + h.phase;
+    const tipX = cx + h.mag * Math.cos(theta);
+    const tipY = cy + h.mag * Math.sin(theta);
+    segments.push({ centerX: cx, centerY: cy, r: h.mag, tipX, tipY });
+    cx = tipX; cy = tipY;
+  }
+  return { segments, tip: [cx, cy] };
+}
+
+/* =========================================================================
+ * Color fill extraction (填色): quantize the source image to a small flat
+ * palette, find connected same-color regions, trace each region's outer
+ * boundary, and emit them as Desmos polygon() expressions placed under the
+ * line-art curves. This runs on the raw image data independently of the
+ * edge/curve pipeline above -- it's a parallel concern, not a modification
+ * of it.
+ * ========================================================================= */
+
+// Coarse histogram -> agglomerative merge down to numColors. Clustering the
+// (few) histogram buckets rather than the (many) pixels directly keeps this
+// fast regardless of image size.
+function quantizeColors(data, width, height, numColors, satAware) {
+  const BUCKET_BITS = 4; // 16 levels/channel -> 4096 max buckets, far fewer in practice
+  const shift = 8 - BUCKET_BITS;
+  const buckets = new Map(); // key -> {count, rSum, gSum, bSum}
+  const n = width * height;
+  for (let i = 0; i < n; i++) {
+    const o = i * 4;
+    if (data[o + 3] < 16) continue; // skip fully transparent
+    const r = data[o], g = data[o + 1], b = data[o + 2];
+    const key = ((r >> shift) << (BUCKET_BITS * 2)) | ((g >> shift) << BUCKET_BITS) | (b >> shift);
+    let e = buckets.get(key);
+    if (!e) { e = { count: 0, rSum: 0, gSum: 0, bSum: 0 }; buckets.set(key, e); }
+    e.count++; e.rSum += r; e.gSum += g; e.bSum += b;
+  }
+  let candidates = Array.from(buckets.values()).map((e) => ({
+    r: e.rSum / e.count, g: e.gSum / e.count, b: e.bSum / e.count, count: e.count,
+  }));
+  if (satAware) {
+    // Rank candidates by count x (1 + 2*saturation) instead of raw count:
+    // small-area but perceptually loud accents (red sash tassels, gold bell
+    // on the Ganyu portrait) otherwise never make the top-96 pool and get
+    // silently absorbed into the nearest large dull cluster at the merge
+    // step -- the single biggest source of "colors don't match" feedback.
+    const score = (c) => {
+      const mx = Math.max(c.r, c.g, c.b), mn = Math.min(c.r, c.g, c.b);
+      const sat = mx > 0 ? (mx - mn) / mx : 0;
+      return c.count * (1 + 2 * sat);
+    };
+    candidates.sort((a, b) => score(b) - score(a));
+  } else {
+    candidates.sort((a, b) => b.count - a.count);
+  }
+  candidates = candidates.slice(0, 96); // cap candidate pool before the O(k^2) merge below
+
+  function dist2(a, b) {
+    const dr = a.r - b.r, dg = a.g - b.g, db = a.b - b.b;
+    return dr * dr + dg * dg + db * db;
+  }
+  while (candidates.length > numColors) {
+    let bi = 0, bj = 1, bd = Infinity;
+    for (let i = 0; i < candidates.length; i++) {
+      for (let j = i + 1; j < candidates.length; j++) {
+        const d = dist2(candidates[i], candidates[j]);
+        if (d < bd) { bd = d; bi = i; bj = j; }
+      }
+    }
+    const a = candidates[bi], b = candidates[bj];
+    const totalCount = a.count + b.count;
+    const merged = {
+      r: (a.r * a.count + b.r * b.count) / totalCount,
+      g: (a.g * a.count + b.g * b.count) / totalCount,
+      b: (a.b * a.count + b.b * b.count) / totalCount,
+      count: totalCount,
+    };
+    candidates.splice(bj, 1);
+    candidates.splice(bi, 1);
+    candidates.push(merged);
+  }
+  const palette = candidates.map((c) => ({ r: Math.round(c.r), g: Math.round(c.g), b: Math.round(c.b), count: c.count }));
+
+  const labels = new Int32Array(n);
+  for (let i = 0; i < n; i++) {
+    const o = i * 4;
+    if (data[o + 3] < 16) { labels[i] = -1; continue; }
+    const r = data[o], g = data[o + 1], b = data[o + 2];
+    let best = 0, bestD = Infinity;
+    for (let p = 0; p < palette.length; p++) {
+      const dr = r - palette[p].r, dg = g - palette[p].g, db = b - palette[p].b;
+      const d = dr * dr + dg * dg + db * db;
+      if (d < bestD) { bestD = d; best = p; }
+    }
+    labels[i] = best;
+  }
+  return { labels, palette };
+}
+
+// 3x3 mode filter over the label map. JPEG-compressed art (soft-shaded anime
+// portraits especially) quantizes into salt-and-pepper speckle along every
+// gradient; tracing those specks yields thousands of junk polygons. Majority
+// vote per pixel (ties keep the center label so flat areas are stable) cleans
+// them without moving real region boundaries more than ~1px per pass.
+function smoothLabels(labels, width, height, passes) {
+  let src = labels;
+  for (let p = 0; p < passes; p++) {
+    const out = new Int32Array(src.length);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = y * width + x;
+        const center = src[idx];
+        if (center < 0) { out[idx] = center; continue; }
+        const counts = new Map();
+        let best = center, bestN = 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            const nx = x + dx, ny = y + dy;
+            if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+            const l = src[ny * width + nx];
+            if (l < 0) continue;
+            const n = (counts.get(l) || 0) + 1;
+            counts.set(l, n);
+            if (n > bestN || (n === bestN && l === center)) { bestN = n; best = l; }
+          }
+        }
+        out[idx] = best;
+      }
+    }
+    src = out;
+  }
+  return src;
+}
+
+// Border-connected background as a component-level mask: BFS from every
+// border pixel across same-label 4-neighbors. Label-level exclusion (below)
+// cannot distinguish "white studio background" from "white dress worn by the
+// subject" -- they land in the same palette entry, and excluding the label
+// silently deletes the dress (reproduced on the Ganyu portrait). Flooding
+// from the border removes only the background component itself.
+function floodBackgroundMask(labels, width, height, barrier) {
+  const mask = new Uint8Array(width * height);
+  const queue = [];
+  function blocked(idx) { return barrier ? barrier[idx] === 1 : false; }
+  function seed(idx) {
+    if (labels[idx] >= 0 && !mask[idx] && !blocked(idx)) { mask[idx] = 1; queue.push(idx); }
+  }
+  for (let x = 0; x < width; x++) { seed(x); seed((height - 1) * width + x); }
+  for (let y = 0; y < height; y++) { seed(y * width); seed(y * width + width - 1); }
+  while (queue.length) {
+    const i = queue.pop();
+    const l = labels[i];
+    const x = i % width, y = (i / width) | 0;
+    if (x + 1 < width)  { const ni = i + 1;     if (!mask[ni] && labels[ni] === l && !blocked(ni)) { mask[ni] = 1; queue.push(ni); } }
+    if (x - 1 >= 0)     { const ni = i - 1;     if (!mask[ni] && labels[ni] === l && !blocked(ni)) { mask[ni] = 1; queue.push(ni); } }
+    if (y + 1 < height) { const ni = i + width; if (!mask[ni] && labels[ni] === l && !blocked(ni)) { mask[ni] = 1; queue.push(ni); } }
+    if (y - 1 >= 0)     { const ni = i - width; if (!mask[ni] && labels[ni] === l && !blocked(ni)) { mask[ni] = 1; queue.push(ni); } }
+  }
+  return mask;
+}
+
+// Gradient barrier for the background flood: the flood may not cross image
+// contours. Without it, background leaks through 1-2px antialiased bridges
+// between hair strands and eats the near-white highlight regions INSIDE the
+// hair (same palette entry as the white studio background -- reproduced on
+// the Ganyu portrait). Barrier = thresholded Sobel magnitude, so any real
+// contour stops the flood; enclosed background slots that get cut off are
+// merely painted as white polygons on a white background, which is invisible.
+function gradientBarrierMask(data, width, height, threshold) {
+  const gray = toGrayscale(data, width, height);
+  const blurred = gaussianBlur5(gray, width, height);
+  const { mag } = sobel(blurred, width, height);
+  const mask = new Uint8Array(width * height);
+  for (let i = 0; i < mask.length; i++) if (mag[i] >= threshold) mask[i] = 1;
+  return mask;
+}
+
+// Background (border-sampled) + near-white + near-black exclusion. Near-black
+// is treated as line-art stroke, not a fill region -- the existing curve
+// pipeline already traces and draws outlines; without this, a pure line-art
+// image gets its thick strokes misdetected as "filled regions" (confirmed:
+// reproduced on both dragon demos and test-shapes.png before this exclusion
+// was added). Threshold is conservative so genuinely dark-but-not-pure-black
+// colors (navy uniforms, dark brown hair) still come through as real fills.
+function detectExcludedLabels(labels, width, height, palette, whiteThreshold, blackThreshold) {
+  const excluded = new Set();
+  for (let p = 0; p < palette.length; p++) {
+    const c = palette[p];
+    if (c.r >= whiteThreshold && c.g >= whiteThreshold && c.b >= whiteThreshold) excluded.add(p);
+    if (c.r <= blackThreshold && c.g <= blackThreshold && c.b <= blackThreshold) excluded.add(p);
+  }
+  const borderCounts = new Map();
+  function bump(x, y) {
+    const l = labels[y * width + x];
+    if (l < 0) return;
+    borderCounts.set(l, (borderCounts.get(l) || 0) + 1);
+  }
+  for (let x = 0; x < width; x++) { bump(x, 0); bump(x, height - 1); }
+  for (let y = 0; y < height; y++) { bump(0, y); bump(width - 1, y); }
+  let bestLabel = -1, bestCount = 0;
+  for (const [l, c] of borderCounts) if (c > bestCount) { bestCount = c; bestLabel = l; }
+  if (bestLabel >= 0) excluded.add(bestLabel);
+  return excluded;
+}
+
+// Connected components per color label (8-connected), skipping excluded
+// labels. Same spatially-disconnected-regions-of-the-same-color-are-separate-
+// components semantics as the edge-map CC analysis used elsewhere in this
+// file's development, just keyed on color label instead of edge/no-edge.
+function connectedComponentsByLabel(labels, width, height, excluded, bgMask) {
+  const visited = new Uint8Array(width * height);
+  if (bgMask) for (let i = 0; i < visited.length; i++) if (bgMask[i]) visited[i] = 1;
+  const components = [];
+  const stack = [];
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = y * width + x;
+      if (visited[idx]) continue;
+      const label = labels[idx];
+      if (label < 0 || excluded.has(label)) { visited[idx] = 1; continue; }
+      let minX = x, maxX = x, minY = y, maxY = y, area = 0;
+      const pixels = [];
+      stack.length = 0;
+      stack.push(idx);
+      visited[idx] = 1;
+      while (stack.length) {
+        const i2 = stack.pop();
+        const px = i2 % width, py = (i2 / width) | 0;
+        pixels.push(i2);
+        area++;
+        if (px < minX) minX = px; if (px > maxX) maxX = px;
+        if (py < minY) minY = py; if (py > maxY) maxY = py;
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = px + dx, ny = py + dy;
+            if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+            const ni = ny * width + nx;
+            if (visited[ni]) continue;
+            if (labels[ni] !== label) continue;
+            visited[ni] = 1;
+            stack.push(ni);
+          }
+        }
+      }
+      components.push({ label, pixels, area, bbox: { minX, maxX, minY, maxY } });
+    }
+  }
+  return components;
+}
+
+// Moore-neighbor boundary tracing on a component's local bbox mask. Holes
+// inside a region (e.g. a donut shape) are not subtracted -- Desmos polygons
+// don't support holes, and whatever color fills the hole is a separate
+// region painted on top anyway, so the approximation is invisible in
+// practice (verified visually on the fox/bunny test images).
+function traceBoundary(component, width) {
+  const { bbox, pixels } = component;
+  const w = bbox.maxX - bbox.minX + 1, h = bbox.maxY - bbox.minY + 1;
+  const mask = new Uint8Array(w * h);
+  for (const idx of pixels) {
+    const px = idx % width, py = (idx / width) | 0;
+    mask[(py - bbox.minY) * w + (px - bbox.minX)] = 1;
+  }
+  function at(x, y) {
+    if (x < 0 || x >= w || y < 0 || y >= h) return 0;
+    return mask[y * w + x];
+  }
+  let startX = -1, startY = -1;
+  outer:
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (at(x, y)) { startX = x; startY = y; break outer; }
+    }
+  }
+  if (startX < 0) return [];
+  if (pixels.length === 1) return [[startX + bbox.minX, startY + bbox.minY]];
+
+  const nbrs = [[-1, 0], [-1, -1], [0, -1], [1, -1], [1, 0], [1, 1], [0, 1], [-1, 1]]; // W,NW,N,NE,E,SE,S,SW
+  const boundary = [];
+  let cx = startX, cy = startY, backtrackIdx = 0;
+  boundary.push([cx, cy]);
+  const maxIterations = w * h * 8 + 64;
+  let iterations = 0;
+  while (iterations++ < maxIterations) {
+    let foundDirIdx = -1;
+    for (let k = 0; k < 8; k++) {
+      const dirIdx = (backtrackIdx + 1 + k) % 8;
+      const nx = cx + nbrs[dirIdx][0], ny = cy + nbrs[dirIdx][1];
+      if (at(nx, ny)) { foundDirIdx = dirIdx; break; }
+    }
+    if (foundDirIdx < 0) break; // isolated pixel, shouldn't happen past the length===1 check above
+    const nx = cx + nbrs[foundDirIdx][0], ny = cy + nbrs[foundDirIdx][1];
+    if (nx === startX && ny === startY && boundary.length > 1) break;
+    cx = nx; cy = ny;
+    backtrackIdx = (foundDirIdx + 4) % 8;
+    boundary.push([cx, cy]);
+    if (boundary.length > w * h + 8) break; // safety valve
+  }
+  return boundary.map(([x, y]) => [x + bbox.minX, y + bbox.minY]);
+}
+
+function fillColorHex(c) {
+  const h = (n) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, '0');
+  return '#' + h(c.r) + h(c.g) + h(c.b);
+}
+
+function downsampleToVertexCap(points, cap) {
+  if (points.length <= cap) return points;
+  const stride = points.length / cap;
+  const out = [];
+  for (let i = 0; i < cap; i++) out.push(points[Math.floor(i * stride)]);
+  return out;
+}
+
+// Orchestrates the above into the final polygon list: quantize -> exclude
+// background/white/black -> connected components -> area filter -> trace ->
+// simplify -> vertex cap -> area-sort -> polygon count cap.
+function extractFillPolygons(data, width, height, opts) {
+  const {
+    numColors = 14, minAreaPx = 60, whiteThreshold = 235, blackThreshold = 25,
+    rdpEpsilon = 1.8, vertexCap = 360, maxPolygons = 800, fine = false,
+  } = opts || {};
+  const t0 = performance.now();
+  let { labels, palette } = quantizeColors(data, width, height, numColors, fine);
+  const tQuantize = performance.now();
+  // Fine mode (soft-shaded / photographic art): speckle cleanup + component-
+  // level background removal instead of label-level color exclusion, so
+  // subject regions that share the background's palette color survive.
+  // Standard mode keeps the original label-level path byte-for-byte.
+  let excluded, bgMask = null;
+  if (fine) {
+    labels = smoothLabels(labels, width, height, 2);
+    bgMask = floodBackgroundMask(labels, width, height, gradientBarrierMask(data, width, height, 24));
+    excluded = new Set();
+    for (let p = 0; p < palette.length; p++) {
+      const c = palette[p];
+      if (c.r >= whiteThreshold && c.g >= whiteThreshold && c.b >= whiteThreshold) excluded.add(p);
+      if (c.r <= blackThreshold && c.g <= blackThreshold && c.b <= blackThreshold) excluded.add(p);
+    }
+  } else {
+    excluded = detectExcludedLabels(labels, width, height, palette, whiteThreshold, blackThreshold);
+  }
+  const allComponents = connectedComponentsByLabel(labels, width, height, excluded, bgMask);
+  const tCC = performance.now();
+  const kept = allComponents.filter((c) => c.area >= minAreaPx);
+  kept.sort((a, b) => b.area - a.area);
+  const capped = kept.slice(0, maxPolygons);
+
+  const polygons = [];
+  for (const comp of capped) {
+    let boundary = traceBoundary(comp, width);
+    if (boundary.length < 3) continue;
+    let simplified = rdpSimplify(boundary, rdpEpsilon);
+    if (simplified.length < 3) simplified = boundary;
+    simplified = downsampleToVertexCap(simplified, vertexCap);
+    let color;
+    if (fine) {
+      // True mean of the component's own pixels, not the palette entry: the
+      // agglomerative merge dilutes saturated accents into their absorbing
+      // cluster's average, so palette color systematically under-saturates.
+      let r = 0, g = 0, b = 0, m = 0;
+      const stride = Math.max(1, Math.floor(comp.pixels.length / 512));
+      for (let pi = 0; pi < comp.pixels.length; pi += stride) {
+        const o = comp.pixels[pi] * 4;
+        r += data[o]; g += data[o + 1]; b += data[o + 2]; m++;
+      }
+      color = fillColorHex({ r: r / m, g: g / m, b: b / m });
+    } else {
+      color = fillColorHex(palette[comp.label]);
+    }
+    polygons.push({ color, points: simplified, area: comp.area });
+  }
+  const tTrace = performance.now();
+
+  return {
+    polygons,
+    palette,
+    stats: {
+      regionsBeforeFilter: allComponents.length,
+      regionsAfterFilter: kept.length,
+      regionsCapped: kept.length - capped.length,
+      polygonCount: polygons.length,
+      quantizeMs: Math.round(tQuantize - t0),
+      ccMs: Math.round(tCC - tQuantize),
+      traceMs: Math.round(tTrace - tCC),
+      totalMs: Math.round(tTrace - t0),
+    },
+  };
+}
+
+// ---- vector helpers (plain [x,y] arrays) ----
+function v_sub(a, b) { return [a[0] - b[0], a[1] - b[1]]; }
+function v_add(a, b) { return [a[0] + b[0], a[1] + b[1]]; }
+function v_scale(a, s) { return [a[0] * s, a[1] * s]; }
+function v_dot(a, b) { return a[0] * b[0] + a[1] * b[1]; }
+function v_dist(a, b) { return Math.hypot(a[0] - b[0], a[1] - b[1]); }
+function v_normalize(a) {
+  const len = Math.hypot(a[0], a[1]);
+  return len === 0 ? [0, 0] : [a[0] / len, a[1] / len];
+}
+function v_negate(a) { return [-a[0], -a[1]]; }
+
+function bernstein(i, u) {
+  const t = 1 - u;
+  switch (i) {
+    case 0: return t * t * t;
+    case 1: return 3 * u * t * t;
+    case 2: return 3 * u * u * t;
+    case 3: return u * u * u;
+  }
+}
+
+function bezierQ(ctrl, u) {
+  let x = 0, y = 0;
+  for (let i = 0; i < 4; i++) {
+    const b = bernstein(i, u);
+    x += b * ctrl[i][0];
+    y += b * ctrl[i][1];
+  }
+  return [x, y];
+}
+
+function evalDeCasteljau(ctrl, u) {
+  let pts = ctrl.map((p) => p.slice());
+  while (pts.length > 1) {
+    const next = [];
+    for (let i = 0; i < pts.length - 1; i++) {
+      next.push([
+        (1 - u) * pts[i][0] + u * pts[i + 1][0],
+        (1 - u) * pts[i][1] + u * pts[i + 1][1],
+      ]);
+    }
+    pts = next;
+  }
+  return pts[0];
+}
+
+function bezierDerivative(bez, u, order) {
+  let ctrl = bez;
+  for (let o = 0; o < order; o++) {
+    const n = ctrl.length - 1;
+    const next = [];
+    for (let i = 0; i < n; i++) {
+      next.push([n * (ctrl[i + 1][0] - ctrl[i][0]), n * (ctrl[i + 1][1] - ctrl[i][1])]);
+    }
+    ctrl = next;
+  }
+  return evalDeCasteljau(ctrl, u);
+}
+
+function chordLengthParameterize(points) {
+  const u = [0];
+  for (let i = 1; i < points.length; i++) {
+    u.push(u[i - 1] + v_dist(points[i], points[i - 1]));
+  }
+  const total = u[u.length - 1];
+  for (let i = 0; i < u.length; i++) u[i] = total === 0 ? 0 : u[i] / total;
+  return u;
+}
+
+function generateBezier(points, parameters, leftTangent, rightTangent) {
+  const first = points[0], last = points[points.length - 1];
+  const bez = [first, null, null, last];
+  const A = parameters.map((u) => [v_scale(leftTangent, bernstein(1, u)), v_scale(rightTangent, bernstein(2, u))]);
+  const C = [[0, 0], [0, 0]];
+  const X = [0, 0];
+  for (let i = 0; i < points.length; i++) {
+    const u = parameters[i];
+    C[0][0] += v_dot(A[i][0], A[i][0]);
+    C[0][1] += v_dot(A[i][0], A[i][1]);
+    C[1][0] = C[0][1];
+    C[1][1] += v_dot(A[i][1], A[i][1]);
+    const endsContribution = [
+      (bernstein(0, u) + bernstein(1, u)) * first[0] + (bernstein(2, u) + bernstein(3, u)) * last[0],
+      (bernstein(0, u) + bernstein(1, u)) * first[1] + (bernstein(2, u) + bernstein(3, u)) * last[1],
+    ];
+    const tmp = v_sub(points[i], endsContribution);
+    X[0] += v_dot(A[i][0], tmp);
+    X[1] += v_dot(A[i][1], tmp);
+  }
+  const detC0C1 = C[0][0] * C[1][1] - C[1][0] * C[0][1];
+  const detC0X = C[0][0] * X[1] - C[1][0] * X[0];
+  const detXC1 = X[0] * C[1][1] - X[1] * C[0][1];
+  const alphaL = detC0C1 === 0 ? 0 : detXC1 / detC0C1;
+  const alphaR = detC0C1 === 0 ? 0 : detC0X / detC0C1;
+  const segLength = v_dist(first, last);
+  const eps = 1e-6 * segLength;
+  // The least-squares system for alpha can be near-singular for certain point/
+  // tangent configurations (found on a dense line-art image: a handful of
+  // short ~20-30px path segments produced control points thousands of pixels
+  // away — a control-point handle 100x+ the chord length — which renders as a
+  // near-straight spike shooting off across the whole canvas). The original
+  // Schneider algorithm only guards against alpha being too SMALL (a
+  // degenerate/negative solution); it has no upper bound, so a near-zero
+  // determinant can produce an arbitrarily large but still-positive alpha
+  // that sails right past that check. Cap the handle length at a generous
+  // multiple of the chord itself — comfortably loose for any legitimate
+  // curve shape, but well short of the 100x+ blowups actually observed.
+  const maxAlpha = segLength * 10;
+  if (segLength === 0 || alphaL < eps || alphaR < eps || alphaL > maxAlpha || alphaR > maxAlpha) {
+    const fallback = segLength / 3;
+    bez[1] = v_add(first, v_scale(leftTangent, fallback));
+    bez[2] = v_add(last, v_scale(rightTangent, fallback));
+  } else {
+    bez[1] = v_add(first, v_scale(leftTangent, alphaL));
+    bez[2] = v_add(last, v_scale(rightTangent, alphaR));
+  }
+  return bez;
+}
+
+function computeMaxError(points, bez, parameters) {
+  let maxDist = 0, splitPoint = Math.floor(points.length / 2);
+  for (let i = 0; i < points.length; i++) {
+    const p = bezierQ(bez, parameters[i]);
+    const dist = v_dist(p, points[i]);
+    if (dist > maxDist) { maxDist = dist; splitPoint = i; }
+  }
+  return { maxError: maxDist, splitPoint };
+}
+
+function newtonRaphsonRootFind(bez, point, u) {
+  const d = v_sub(bezierQ(bez, u), point);
+  const qPrime = bezierDerivative(bez, u, 1);
+  const qPrimePrime = bezierDerivative(bez, u, 2);
+  const numerator = v_dot(d, qPrime);
+  const denominator = v_dot(qPrime, qPrime) + v_dot(d, qPrimePrime);
+  if (denominator === 0) return u;
+  return u - numerator / denominator;
+}
+
+function reparameterize(bez, points, parameters) {
+  return parameters.map((u, i) => newtonRaphsonRootFind(bez, points[i], u));
+}
+
+// Estimating an endpoint tangent from only the single immediately-adjacent
+// point is fragile: a thinned skeleton can have a 1px "jog" right next to a
+// corner (an artifact of how the corner pixels happened to thin), and that
+// one noisy pixel then dictates the *entire* tangent direction — e.g. a
+// vertical line whose second point is 1px off gives a ~45deg tangent
+// instead of vertical. GenerateBezier's least-squares fit then extrapolates
+// that wrong direction into a huge, spurious bulge (confirmed: this is
+// exactly what produced the rectangle's rounded "D" corners after adding
+// thinning — RDP kept a few extra points near the corner precisely because
+// of that jog, so the naive single-neighbor tangent got corrupted there
+// while the clean side collapsed to 2 RDP points and never hit this path).
+// Fix: scan past nearby points until one is far enough away to represent
+// the real local direction, rather than trusting whichever pixel happens
+// to be adjacent.
+function robustTangent(points, anchorIdx, dir) {
+  const anchor = points[anchorIdx];
+  const n = points.length;
+  const totalSpan = v_dist(points[0], points[n - 1]);
+  const minDist = Math.max(1.5, totalSpan * 0.05);
+  let target = points[anchorIdx + dir];
+  let i = anchorIdx + dir;
+  while (i >= 0 && i < n) {
+    target = points[i];
+    if (v_dist(points[i], anchor) >= minDist) break;
+    i += dir;
+  }
+  return v_normalize(v_sub(target, anchor));
+}
+
+function computeCenterTangent(points, splitPoint) {
+  return robustTangent(points, splitPoint, -1);
+}
+
+function pointToSegmentDist(p, a, b) {
+  const abx = b[0] - a[0], aby = b[1] - a[1];
+  const abLen2 = abx * abx + aby * aby;
+  if (abLen2 < 1e-9) return v_dist(p, a);
+  let t = ((p[0] - a[0]) * abx + (p[1] - a[1]) * aby) / abLen2;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(p[0] - (a[0] + t * abx), p[1] - (a[1] + t * aby));
+}
+
+// The per-point error check (computeMaxError) only measures distance at the
+// sparse RDP-simplified vertices. Newton-Raphson reparameterization can
+// "game" that check: it slides the parameterization to minimize error at
+// those specific vertices while the curve bulges out and cuts across a real
+// corner between them. This was latent since the original Schneider
+// algorithm (found once sub-pixel NMS started producing cleaner, longer
+// straight runs — sparser RDP output is exactly what exposes the gap between
+// vertices). Guard against it by also checking the fitted curve against the
+// nearest polyline SEGMENT (not vertex) of the actual traced points.
+function curveStraysFromPoints(bez, points, tolerance) {
+  const samples = 50;
+  const maxAllowed = tolerance * 1.5;
+  for (let i = 0; i <= samples; i++) {
+    const p = bezierQ(bez, i / samples);
+    let nearest = Infinity;
+    for (let j = 0; j < points.length - 1; j++) {
+      const d = pointToSegmentDist(p, points[j], points[j + 1]);
+      if (d < nearest) nearest = d;
+      if (nearest <= maxAllowed) break;
+    }
+    if (nearest > maxAllowed) return true;
+  }
+  return false;
+}
+
+function fitCubic(points, leftTangent, rightTangent, error) {
+  const MAX_ITERATIONS = 20;
+  if (points.length === 2) {
+    const dist = v_dist(points[0], points[1]) / 3;
+    const candidate = [points[0], v_add(points[0], v_scale(leftTangent, dist)), v_add(points[1], v_scale(rightTangent, dist)), points[1]];
+    if (curveStraysFromPoints(candidate, points, error)) {
+      // Even the incoming tangent (from a parent split) can be misestimated
+      // near a real corner; fall back to the plain chord direction, which
+      // can't cut a corner since there are only 2 points.
+      const chordDir = v_normalize(v_sub(points[1], points[0]));
+      return [[points[0], v_add(points[0], v_scale(chordDir, dist)), v_add(points[1], v_scale(v_negate(chordDir), dist)), points[1]]];
+    }
+    return [candidate];
+  }
+  let u = chordLengthParameterize(points);
+  let bez = generateBezier(points, u, leftTangent, rightTangent);
+  let res0 = computeMaxError(points, bez, u);
+  let err = res0.maxError, splitPoint = res0.splitPoint;
+  if (err < error && !curveStraysFromPoints(bez, points, error)) return [bez];
+
+  // Give Newton-Raphson reparameterization a chance to converge before
+  // giving up and splitting the point set at the worst-error location.
+  for (let i = 0; i < MAX_ITERATIONS; i++) {
+    const uPrime = reparameterize(bez, points, u);
+    const candidate = generateBezier(points, uPrime, leftTangent, rightTangent);
+    const res = computeMaxError(points, candidate, uPrime);
+    if (res.maxError >= err) break; // stop if reparameterization stops helping
+    bez = candidate;
+    u = uPrime;
+    err = res.maxError;
+    splitPoint = res.splitPoint;
+    if (err < error && !curveStraysFromPoints(bez, points, error)) return [bez];
+  }
+
+  splitPoint = clamp(splitPoint, 1, points.length - 2);
+  const centerTangent = computeCenterTangent(points, splitPoint);
+  const left = fitCubic(points.slice(0, splitPoint + 1), leftTangent, centerTangent, error);
+  const right = fitCubic(points.slice(splitPoint), v_negate(centerTangent), rightTangent, error);
+  return left.concat(right);
+}
+
+function fitCurve(points, maxError) {
+  // de-duplicate consecutive identical points to avoid degenerate tangents
+  const pts = [points[0]];
+  for (let i = 1; i < points.length; i++) {
+    if (v_dist(points[i], pts[pts.length - 1]) > 1e-9) pts.push(points[i]);
+  }
+  if (pts.length < 2) return [];
+  const leftTangent = robustTangent(pts, 0, 1);
+  const rightTangent = robustTangent(pts, pts.length - 1, -1);
+  return fitCubic(pts, leftTangent, rightTangent, maxError);
+}
+
+/* =========================================================================
+ * LaTeX generation — De Casteljau nested form, matching the classic
+ * DesmosBezierRenderer style, with a domain restriction so Desmos doesn't
+ * need a separate slider for t.
+ * ========================================================================= */
+
+function fmtNum(v) {
+  const r = Math.round(v * 10000) / 10000;
+  // avoid "-0"
+  return (r === 0 ? 0 : r).toString();
+}
+
+function bezierAxisLatex(a0, a1, a2, a3) {
+  const T = '\\left(1-t\\right)';
+  const n0 = fmtNum(a0), n1 = fmtNum(a1), n2 = fmtNum(a2), n3 = fmtNum(a3);
+  const Q0 = T + '\\cdot ' + n0 + '+t\\cdot ' + n1;
+  const Q1 = T + '\\cdot ' + n1 + '+t\\cdot ' + n2;
+  const Q2 = T + '\\cdot ' + n2 + '+t\\cdot ' + n3;
+  const R0 = T + '\\left(' + Q0 + '\\right)+t\\left(' + Q1 + '\\right)';
+  const R1 = T + '\\left(' + Q1 + '\\right)+t\\left(' + Q2 + '\\right)';
+  return T + '\\left(' + R0 + '\\right)+t\\left(' + R1 + '\\right)';
+}
+
+// Draw-in animation mechanism, measured (see startDrawAnimation): a shared
+// Desmos variable T_0 sweeping a per-curve reveal fraction -- either
+// inlined via t -> (t*w) substitution, or via Desmos's `with` operator to
+// avoid repeating the w formula ~12 times per curve -- was rejected. Both
+// variants make every one of the N curves reactively depend on T_0, and
+// Desmos re-evaluates and re-renders the ENTIRE dependent set on every
+// single value change, regardless of how compact the formula is. Measured
+// on demo-dragon.png (3116 curves, live browser, requestAnimationFrame
+// timestamps): 9.2fps average, gaps up to 250ms. Even on the lighter
+// demo-dragon-v2.png (1049 curves): 20.8fps average, gaps up to 348ms.
+// Neither is "fluid" by the bar this feature was scoped to. Shipped
+// mechanism instead: plain static curves (this function, unchanged from
+// before this feature existed) with a batched hidden:true -> hidden:false
+// reveal driven from JS -- see startDrawAnimation.
+function segmentLatex(p0, p1, p2, p3) {
+  const x = bezierAxisLatex(p0[0], p1[0], p2[0], p3[0]);
+  const y = bezierAxisLatex(p0[1], p1[1], p2[1], p3[1]);
+  return '\\left(' + x + ',' + y + '\\right)\\left\\{0\\le t\\le1\\right\\}';
+}
+
+// Desmos's default blue harmonizes with the ink-on-cream chrome; it's the
+// only accent used for rendered curves (design spec: accent ramp is reserved
+// for in-tool states, never toolbar chrome).
+const CURVE_COLOR = '#2d70b3';
+
+// Fine mode line color: anime lineart is a darkened version of the local
+// color, not a uniform ink. Sample the source pixels under the traced path
+// and darken -- hair outlines come out deep blue, gold trim dark brown, etc.
+function sampleLineColor(path, data, width) {
+  let r = 0, g = 0, b = 0, n = 0;
+  const step = Math.max(1, Math.floor(path.length / 60));
+  for (let i = 0; i < path.length; i += step) {
+    const x = Math.round(path[i][0]), y = Math.round(path[i][1]);
+    const o = (y * width + x) * 4;
+    if (data[o + 3] < 16) continue;
+    r += data[o]; g += data[o + 1]; b += data[o + 2]; n++;
+  }
+  if (!n) return CURVE_COLOR;
+  const k = 0.45; // darken toward ink while keeping the hue
+  return fillColorHex({ r: (r / n) * k, g: (g / n) * k, b: (b / n) * k });
+}
+
+// Fourier-mode latex: compact list + total() parametric form,
+//   x(t) = a0 + total(R * cos(N*2*pi*t + P))
+//   y(t) = b0 + total(R * sin(N*2*pi*t + P))
+// with R (magnitude), N (signed frequency), P (phase) as equal-length inline
+// Desmos list literals -- avoids named list variables (which would need a
+// per-path-unique name to not collide across expressions). Same y = R*sin(...)
+// as x = R*cos(...), same R/N/P lists -- no separate phase-offset list needed
+// (see reconstructPoint's derivation: both axes come from the same c_n).
+//
+// Spike-verified against the live Desmos v1.11 API (node+playwright,
+// headless Chrome, calculator.expressionAnalysis): a bare scalar immediately
+// followed by `\left[...\right]` (e.g. "2\pi\left[1,2,-3\right]") parses as
+// LIST INDEXING ("Cannot index a number with a list of numbers"), not
+// multiplication -- Desmos's indexing syntax is triggered by ANY expression
+// directly adjacent to `\left[`, not just named identifiers. Fix: never let
+// a list literal sit immediately after a bare scalar; always force explicit
+// `\cdot` multiplication around it (see the list-first `\cdot 2\pi \cdot t`
+// ordering below). Confirmed working via calculator.expressionAnalysis
+// (isGraphable:true, isError:false) and a visual screenshot of the rendered
+// curve.
+function fourierPathLatex(dc, harmonics) {
+  if (harmonics.length === 0) {
+    // Degenerate: no harmonics survived truncation (only possible for a
+    // near-zero-length path) -- render the DC point itself as a valid
+    // (if trivial) parametric curve rather than emitting an empty list
+    // literal into total(), which Desmos does not accept.
+    const a0 = fmtNum(dc[0]), b0 = fmtNum(dc[1]);
+    return '\\left(' + a0 + '+0t,' + b0 + '+0t\\right)\\left\\{0\\le t\\le1\\right\\}';
+  }
+  const Rlist = '\\left[' + harmonics.map((h) => fmtNum(h.mag)).join(',') + '\\right]';
+  const Nlist = '\\left[' + harmonics.map((h) => fmtNum(h.n)).join(',') + '\\right]';
+  const Plist = '\\left[' + harmonics.map((h) => fmtNum(h.phase)).join(',') + '\\right]';
+  const a0 = fmtNum(dc[0]), b0 = fmtNum(dc[1]);
+  const angle = Nlist + '\\cdot 2\\pi \\cdot t+' + Plist;
+  const x = a0 + '+\\operatorname{total}\\left(' + Rlist + '\\cos\\left(' + angle + '\\right)\\right)';
+  const y = b0 + '+\\operatorname{total}\\left(' + Rlist + '\\sin\\left(' + angle + '\\right)\\right)';
+  return '\\left(' + x + ',' + y + '\\right)\\left\\{0\\le t\\le1\\right\\}';
+}
+
+/* =========================================================================
+ * Pixel-grid wordmark — 5x7 bitmap font rendered as inline SVG <rect> cells,
+ * per the opencode.ai design DNA (square cells, not monospace glyphs).
+ * ========================================================================= */
+
+const PIXEL_FONT = {
+  D: ['11110','10001','10001','10001','10001','10001','11110'],
+  E: ['11111','10000','10000','11110','10000','10000','11111'],
+  S: ['01111','10000','10000','01110','00001','00001','11110'],
+  M: ['10001','11011','10101','10101','10001','10001','10001'],
+  O: ['01110','10001','10001','10001','10001','10001','01110'],
+  B: ['11110','10001','10001','11110','10001','10001','11110'],
+  Z: ['11111','00001','00010','00100','01000','10000','11111'],
+  I: ['11111','00100','00100','00100','00100','00100','11111'],
+  R: ['11110','10001','10001','11110','10100','10010','10001'],
+  ' ': ['000','000','000','000','000','000','000'],
+};
+
+function buildPixelWordmark(text, color) {
+  const cell = 3, gap = 1, rows = 7, letterGapCols = 1;
+  const rects = [];
+  let cursorX = 0;
+  for (const ch of text.toUpperCase()) {
+    const glyph = PIXEL_FONT[ch];
+    if (!glyph) continue;
+    const cols = glyph[0].length;
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        if (glyph[r][c] === '1') {
+          rects.push('<rect x="' + (cursorX + c * (cell + gap)) + '" y="' + (r * (cell + gap)) +
+            '" width="' + cell + '" height="' + cell + '" fill="' + color + '"/>');
+        }
+      }
+    }
+    cursorX += cols * (cell + gap) + letterGapCols * (cell + gap);
+  }
+  const w = cursorX, h = rows * (cell + gap) - gap;
+  return '<svg width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h +
+    '" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="' + text + '">' + rects.join('') + '</svg>';
+}
+
+document.getElementById('wordmark').innerHTML = buildPixelWordmark('DESMOS BEZIER', '#201d1d');
+
+/* =========================================================================
+ * UI glue
+ * ========================================================================= */
+
+const fileInput = document.getElementById('fileInput');
+const thresholdSlider = document.getElementById('thresholdSlider');
+const toleranceSlider = document.getElementById('toleranceSlider');
+const toleranceLabel = document.getElementById('toleranceLabel');
+const harmonicsSlider = document.getElementById('harmonicsSlider');
+const harmonicsLabel = document.getElementById('harmonicsLabel');
+const maxCurvesSlider = document.getElementById('maxCurvesSlider');
+const speedSlider = document.getElementById('speedSlider');
+const fillToggleBtn = document.getElementById('fillToggleBtn');
+const fourierToggleBtn = document.getElementById('fourierToggleBtn');
+const thresholdVal = document.getElementById('thresholdVal');
+const toleranceVal = document.getElementById('toleranceVal');
+const harmonicsVal = document.getElementById('harmonicsVal');
+const maxCurvesVal = document.getElementById('maxCurvesVal');
+const speedVal = document.getElementById('speedVal');
+const renderBtn = document.getElementById('renderBtn');
+const drawBtn = document.getElementById('drawBtn');
+const statsEl = document.getElementById('stats');
+const calculatorEl = document.getElementById('calculator');
+const dropOverlay = document.getElementById('dropOverlay');
+const previewWrap = document.getElementById('previewWrap');
+const previewCanvas = document.getElementById('previewCanvas');
+const sourceSection = document.getElementById('sourceSection');
+const sourceCanvas = document.getElementById('sourceCanvas');
+const curveSection = document.getElementById('curveSection');
+const curveCaption = document.getElementById('curveCaption');
+const curveMarker = document.getElementById('curveMarker');
+
+function setCurveCollapsed(collapsed) {
+  curveSection.classList.toggle('collapsed', collapsed);
+  curveMarker.textContent = collapsed ? '[+]' : '[-]';
+}
+
+curveCaption.addEventListener('click', () => {
+  setCurveCollapsed(!curveSection.classList.contains('collapsed'));
+});
+
+let currentImageData = null;
+let calculator = null;
+let fillEnabled = true;
+let fourierMode = false;
+
+fillToggleBtn.addEventListener('click', () => {
+  fillEnabled = !fillEnabled;
+  fillToggleBtn.setAttribute('aria-pressed', String(fillEnabled));
+});
+
+const fineFillBtn = document.getElementById('fineFillBtn');
+let fineFillEnabled = false;
+fineFillBtn.addEventListener('click', () => {
+  fineFillEnabled = !fineFillEnabled;
+  fineFillBtn.setAttribute('aria-pressed', String(fineFillEnabled));
+});
+
+// Mode switch only takes effect on the next render() (same "change a slider,
+// re-render to apply" convention every other control already uses) -- see
+// brief: "切模式后需重新渲染才生效". Swaps which of 容差(仅贝塞尔)/谐波数(仅傅里叶)
+// is visible; both sliders' underlying values are preserved across toggles.
+fourierToggleBtn.addEventListener('click', () => {
+  fourierMode = !fourierMode;
+  fourierToggleBtn.setAttribute('aria-pressed', String(fourierMode));
+  toleranceLabel.hidden = fourierMode;
+  harmonicsLabel.hidden = !fourierMode;
+});
+
+/* =========================================================================
+ * Draw-in animation: an overlay <canvas> on top of #calculator sweeps each
+ * curve open (De Casteljau split at t=progress, draw the traced-so-far
+ * left half) at a true 60fps, then hands off to Desmos with a single
+ * setState call once everything is fully drawn.
+ *
+ * Why not animate through Desmos's own API: measured directly (see
+ * segmentLatex's history) -- calculator.setExpressions() has a real,
+ * roughly linear cost of ~8-34ms per curve TOUCHED (worse for reveals than
+ * for hides, and worse still as more of the scene is already visible), so
+ * animating thousands of curves through repeated Desmos calls is bounded
+ * by an external per-touch cost no scheduling trick beats. The canvas has
+ * no such per-item API cost -- redrawing several thousand cubic strokes a
+ * frame is trivial 2D canvas work -- so the sweep happens entirely
+ * client-side, and Desmos is only touched ONCE at the very end (a bulk
+ * setState, the same operation render() already uses to load the hidden
+ * curves, measured at roughly 0.5-3s even for 3000+ curves).
+ *
+ * Math -> pixel mapping is re-queried every frame via
+ * calculator.graphpaperBounds (confirmed live: pixelCoordinates share the
+ * same top-left origin as #calculator's own inset:0 box, so the overlay
+ * canvas -- positioned the same way -- needs no extra offset), so
+ * panning/zooming mid-animation keeps the sweeping strokes glued to the
+ * graph instead of drifting.
+ * ========================================================================= */
+const STATS_SEP = '   ';
+const SWEEP_TOTAL_TARGET_MS = 8000; // spreads curve START times across ~8s, independent of curve count
+const SWEEP_INTERVAL_FLOOR_MS = 2;
+const SWEEP_INTERVAL_CEILING_MS = 40;
+const SWEEP_DURATION_MS = 400; // how long one curve takes to trace from empty to full, at 1x speed
+const FILL_PHASE_TOTAL_MS = 2000; // second phase, after line work finishes: fills pop in one region at a time, top-to-bottom
+const MAX_FRAME_DT_MS = 50; // clamp a slow/delayed frame's contribution to the virtual clock -- see step()'s comment
+const FOURIER_FEATURED_COUNT = 5; // top-K longest paths get the full epicycle chain shown; see brief "最长3-5条"
+const FOURIER_FEATURED_SLOT_MS = 1600; // each featured path's full spin+trace duration, at 1x speed -- 5*1600=8000ms lines up with SWEEP_TOTAL_TARGET_MS
+
+let drawRafId = null;
+let drawGeneration = 0;
+let lastStatsHtml = '';
+let currentCurveCount = 0; // set at the end of each successful render()
+let currentMathBeziers = []; // this render's curves in MATH coords (y already flipped), top-to-bottom order -- what the overlay sweeps
+let currentFillPolygons = []; // this render's fill polygons in MATH coords (y already flipped); not swept by the overlay, pop in with the final commit
+let currentFillOpacity = '0.9'; // set per-render; '1' in fine-fill mode, '0.9' standard (string: Desmos setState requirement)
+let currentCurveColors = []; // parallel to currentMathBeziers; per-path sampled ink in fine mode, empty -> CURVE_COLOR
+let speedMultiplier = 1; // live-adjustable via the 绘制速度 slider; scales the virtual animation clock, not wall-clock time directly
+
+// Fourier-mode animation state, parallel to currentMathBeziers/currentCurveCount
+// above. Each entry: {dc, harmonics, tMax, arcLen, samples} in MATH coords
+// (y already flipped via flipHarmonicsY) -- samples is a precomputed dense
+// reconstruction (t in [0, tMax]) used both for the ink-trace reveal and the
+// (rare) fallback of a path with zero surviving harmonics.
+let currentFourierPaths = [];
+const FOURIER_SAMPLE_COUNT = 240; // ink-trace resolution per path, independent of harmonic count
+
+const drawOverlay = document.getElementById('drawOverlay');
+const overlayCtx = drawOverlay.getContext('2d');
+
+function resizeOverlayToCalculator() {
+  const rect = calculatorEl.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(rect.width * dpr));
+  const h = Math.max(1, Math.round(rect.height * dpr));
+  if (drawOverlay.width !== w || drawOverlay.height !== h) {
+    drawOverlay.width = w;
+    drawOverlay.height = h;
+  }
+  overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function lerp2(a, b, t) {
+  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+}
+
+// De Casteljau subdivision at parameter t: returns just the "already drawn"
+// left sub-curve (from 0 to t), which is itself a valid cubic Bezier.
+function deCasteljauLeft(bez, t) {
+  const [p0, p1, p2, p3] = bez;
+  const q1 = lerp2(p0, p1, t);
+  const a = lerp2(p1, p2, t);
+  const q2 = lerp2(q1, a, t);
+  const r2 = lerp2(p2, p3, t);
+  const r1 = lerp2(a, r2, t);
+  const q3 = lerp2(q2, r1, t);
+  return [p0, q1, q2, q3];
+}
+
+function mathToPixel(mx, my, bounds) {
+  const mc = bounds.mathCoordinates, pc = bounds.pixelCoordinates;
+  return [
+    pc.left + ((mx - mc.left) / mc.width) * pc.width,
+    pc.top + ((mc.top - my) / mc.height) * pc.height,
+  ];
+}
+
+function cancelDrawAnimation() {
+  drawGeneration++;
+  if (drawRafId !== null) {
+    cancelAnimationFrame(drawRafId);
+    drawRafId = null;
+  }
+  drawOverlay.style.display = 'none';
+  if (drawOverlay.width && drawOverlay.height) overlayCtx.clearRect(0, 0, drawOverlay.width, drawOverlay.height);
+}
+
+function startDrawAnimation() {
+  cancelDrawAnimation();
+  if (!calculator || currentCurveCount === 0 || currentMathBeziers.length === 0) return;
+  const myGen = drawGeneration;
+  const n = currentCurveCount;
+  const interval = Math.max(SWEEP_INTERVAL_FLOOR_MS, Math.min(SWEEP_INTERVAL_CEILING_MS, SWEEP_TOTAL_TARGET_MS / n));
+  const lineTimelineMs = (n - 1) * interval + SWEEP_DURATION_MS;
+
+  // Second phase: fills pop in one region at a time (no natural "sweep"
+  // parameter for an arbitrary polygon the way De Casteljau splitting gives
+  // curves, so each region just appears whole at its scheduled moment,
+  // spread evenly across FILL_PHASE_TOTAL_MS). Zero fills -> zero extra
+  // phase length, so a no-fill render (toggle off, or a B&W image) reaches
+  // the final commit at exactly the same time as before this feature
+  // existed -- no added wait for content that isn't there.
+  const numFills = currentFillPolygons.length;
+  const fillPhaseMs = numFills > 0 ? FILL_PHASE_TOTAL_MS : 0;
+  const fillInterval = numFills > 0 ? fillPhaseMs / numFills : 0;
+  const grandTotalMs = lineTimelineMs + fillPhaseMs;
+
+  resizeOverlayToCalculator();
+  drawOverlay.style.display = 'block';
+
+  let lastFrameTime = performance.now();
+  let animElapsedMs = 0;
+
+  function step() {
+    if (myGen !== drawGeneration) return; // superseded by a re-render or replay
+
+    // Virtual clock: real time advances at speedMultiplier's rate. Changing
+    // the slider mid-run just changes how fast animElapsedMs accumulates
+    // from here on -- no restart, no jump, no recomputing from a fixed
+    // start time and multiplier (which would snap progress on a speed
+    // change instead of continuing smoothly from wherever it was).
+    //
+    // Sample performance.now() directly rather than trusting rAF's own
+    // timestamp argument: measured directly in this environment, that
+    // argument can drift behind real wall-clock time as the callback rate
+    // rises (confirmed live -- the gap between the two grew from under
+    // 1ms up to ~17ms across just 15 frames), which silently under-counts
+    // dt and was making the whole animation run ~4x slower than intended
+    // (3116-curve run measured at 33s instead of the intended ~8s).
+    //
+    // dt is also clamped: the very first tick after the heavy setState
+    // that just loaded thousands of hidden curves can land noticeably
+    // late (residual Desmos-internal work delaying the next paint), which
+    // otherwise dumps that whole real-world gap into animElapsedMs in one
+    // step -- reproduced during testing as the entire 1049-curve animation
+    // completing within the first ~50ms instead of over ~8s. Capping dt
+    // means a slow frame just costs a brief real-time pause, never skips
+    // the virtual clock ahead.
+    const now = performance.now();
+    const dt = Math.min(now - lastFrameTime, MAX_FRAME_DT_MS);
+    lastFrameTime = now;
+    animElapsedMs += dt * speedMultiplier;
+
+    resizeOverlayToCalculator(); // cheap no-op unless the window was resized
+    const bounds = calculator.graphpaperBounds;
+    overlayCtx.clearRect(0, 0, drawOverlay.width, drawOverlay.height);
+
+    // Fills first (drawn under), matching the same before-the-curves
+    // ordering used in the real Desmos expression list. Each region pops
+    // in whole -- there's no De Casteljau-style partial-fill parameter for
+    // an arbitrary polygon -- fillElapsedMs only advances once the line
+    // phase is done, so line work stays the sole focus until it's complete.
+    const fillElapsedMs = animElapsedMs - lineTimelineMs;
+    if (numFills > 0 && fillElapsedMs > 0) {
+      const fillsRevealed = Math.min(numFills, Math.floor(fillElapsedMs / fillInterval) + 1);
+      overlayCtx.globalAlpha = parseFloat(currentFillOpacity); // must match the fillOpacity emitted to Desmos, or the commit handoff will visibly jump
+      for (let i = 0; i < fillsRevealed; i++) {
+        const poly = currentFillPolygons[i];
+        const pts = poly.points.map((p) => mathToPixel(p[0], p[1], bounds));
+        overlayCtx.fillStyle = poly.color;
+        overlayCtx.beginPath();
+        overlayCtx.moveTo(pts[0][0], pts[0][1]);
+        for (let k = 1; k < pts.length; k++) overlayCtx.lineTo(pts[k][0], pts[k][1]);
+        overlayCtx.closePath();
+        overlayCtx.fill();
+      }
+      overlayCtx.globalAlpha = 1;
+    }
+
+    // Curves on top, held fully drawn once the line phase itself is done
+    // (clamping p at 1) so they stay visible and complete throughout the
+    // whole fill phase rather than re-animating or disappearing.
+    overlayCtx.strokeStyle = CURVE_COLOR;
+    overlayCtx.lineWidth = currentCurveColors.length ? 1.75 : 2.5; // must match the Desmos lineWidth emitted below
+    overlayCtx.lineCap = 'round';
+    overlayCtx.lineJoin = 'round';
+    for (let i = 0; i < n; i++) {
+      const s = i * interval;
+      const p = Math.max(0, Math.min(1, (animElapsedMs - s) / SWEEP_DURATION_MS));
+      if (p <= 0) continue;
+      overlayCtx.strokeStyle = currentCurveColors[i] || CURVE_COLOR;
+      const bez = currentMathBeziers[i];
+      const drawnBez = p >= 1 ? bez : deCasteljauLeft(bez, p);
+      const sp0 = mathToPixel(drawnBez[0][0], drawnBez[0][1], bounds);
+      const sp1 = mathToPixel(drawnBez[1][0], drawnBez[1][1], bounds);
+      const sp2 = mathToPixel(drawnBez[2][0], drawnBez[2][1], bounds);
+      const sp3 = mathToPixel(drawnBez[3][0], drawnBez[3][1], bounds);
+      overlayCtx.beginPath();
+      overlayCtx.moveTo(sp0[0], sp0[1]);
+      overlayCtx.bezierCurveTo(sp1[0], sp1[1], sp2[0], sp2[1], sp3[0], sp3[1]);
+      overlayCtx.stroke();
+    }
+
+    const pct = Math.floor(Math.min(100, (animElapsedMs / grandTotalMs) * 100));
+    statsEl.innerHTML = lastStatsHtml + STATS_SEP + '[>] 绘制中… ' + pct + '%';
+
+    if (animElapsedMs < grandTotalMs) {
+      drawRafId = requestAnimationFrame(step);
+    } else {
+      // Final commit: bulk-unhide every curve (and every fill polygon, which
+      // the overlay never animates -- they simply pop in here) in ONE
+      // setState call, the same bulk operation render() already relies on.
+      // By now the overlay is already showing the complete picture, so
+      // however long this call takes (measured ~0.5-3s even at 3000+
+      // curves), there is nothing left to visually change -- the overlay
+      // masks the hitch until the instant it's hidden, right after the
+      // call returns. Fills stay first in the list so they render under
+      // the curves, matching render()'s own ordering.
+      const finalFillExpressions = currentFillPolygons.map((poly, i) => ({
+        id: 'fill-' + i,
+        type: 'expression',
+        color: poly.color,
+        fillOpacity: currentFillOpacity, // setState (unlike setExpressions) requires this as a string -- confirmed live, a raw number throws "parse can only be called with strings"
+        lineOpacity: currentFillOpacity === '1' ? '1' : '0', // fine mode: self-colored border seals hairline cracks between adjacent quantized regions
+        lineWidth: '2.5',
+        hidden: false,
+        latex: '\\operatorname{polygon}\\left(' + poly.points.map((p) => '\\left(' + fmtNum(p[0]) + ',' + fmtNum(p[1]) + '\\right)').join(',') + '\\right)',
+      }));
+      const finalExpressions = currentMathBeziers.map((bez, i) => ({
+        id: 'bez-' + i,
+        type: 'expression',
+        color: currentCurveColors[i] || CURVE_COLOR,
+        lineWidth: currentCurveColors.length ? '1.75' : undefined,
+        hidden: false,
+        latex: segmentLatex(bez[0], bez[1], bez[2], bez[3]),
+      }));
+      const commitStart = performance.now();
+      const state = calculator.getState();
+      state.expressions.list = finalFillExpressions.concat(finalExpressions);
+      calculator.setState(state);
+      window.__lastCommitMs = Math.round(performance.now() - commitStart); // read by tests/instrumentation only
+      drawRafId = null;
+
+      // Paint barrier: setState RETURNING does not mean Desmos has PAINTED —
+      // its rendering is async, and with thousands of curves (worse at dpr=2)
+      // the gap is user-visible: hiding the overlay here used to expose a
+      // blank/partial graph for a beat before the finished piece popped in
+      // ("clear screen, then re-show the result"). Keep the overlay's final
+      // complete frame up until Desmos reports a finished render pass
+      // (asyncScreenshot's callback fires after one), plus two rAFs so the
+      // painted frame is actually presented; a timer is the fallback in case
+      // the callback never fires.
+      let overlayReleased = false;
+      const releaseOverlay = () => {
+        if (overlayReleased || myGen !== drawGeneration) return;
+        overlayReleased = true;
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          if (myGen !== drawGeneration) return;
+          drawOverlay.style.display = 'none';
+          overlayCtx.clearRect(0, 0, drawOverlay.width, drawOverlay.height);
+          statsEl.innerHTML = lastStatsHtml;
+        }));
+      };
+      // asyncScreenshot's callback never fires in this embed (verified live —
+      // times out with and without opts, and each call emits an extra console
+      // warning), so a deterministic paint event is unavailable. Adaptive
+      // grace instead: paint cost scales with what setState itself cost, so
+      // wait 4× the measured commit time (floor 1.5s). Over-waiting is free —
+      // the overlay is already showing the identical finished picture.
+      const graceMs = Math.max(1500, window.__lastCommitMs * 4);
+      window.__lastPaintBarrier = 'adaptive-' + graceMs + 'ms';
+      setTimeout(releaseOverlay, graceMs);
+    }
+  }
+  drawRafId = requestAnimationFrame(step);
+}
+
+/* =========================================================================
+ * Fourier-mode draw-in animation: same overlay canvas, same generation-token
+ * cancellation, same fills-then-lines-then-bulk-reveal shape as
+ * startDrawAnimation above, but a different per-frame drawing routine --
+ * epicycle chains (rotating vector circles) for the top FOURIER_FEATURED_COUNT
+ * longest paths, plain ink-trace reveal for the rest (brief: "最长3-5条路径
+ * 完整展示本轮系,其余路径加速批量画...只画笔迹不画圆圈"). Kept as a fully separate
+ * function (not merged into startDrawAnimation via branches) so the
+ * already-verified Bezier animation path is untouched by this feature --
+ * zero regression risk on the default mode.
+ * ========================================================================= */
+
+function drawFourierInkTrace(fp, bounds, progress) {
+  const samples = fp.samples;
+  const revealCount = Math.max(1, Math.min(samples.length, Math.round(progress * (samples.length - 1)) + 1));
+  overlayCtx.strokeStyle = CURVE_COLOR;
+  overlayCtx.lineWidth = 2.5;
+  overlayCtx.beginPath();
+  for (let i = 0; i < revealCount; i++) {
+    const [px, py] = mathToPixel(samples[i][0], samples[i][1], bounds);
+    if (i === 0) overlayCtx.moveTo(px, py); else overlayCtx.lineTo(px, py);
+  }
+  overlayCtx.stroke();
+}
+
+// Circles map to circles in pixel space only because aspectCorrectViewport
+// (see render()/renderToDesmos) guarantees the math-to-pixel scale is
+// uniform in x and y -- otherwise a math-space radius would need separate
+// x/y pixel radii (an ellipse).
+function drawEpicycleChain(fp, bounds, t) {
+  const scale = bounds.pixelCoordinates.width / bounds.mathCoordinates.width;
+  const { segments } = epicycleChain(fp.dc, fp.harmonics, t);
+  overlayCtx.lineWidth = 1;
+  overlayCtx.strokeStyle = 'rgba(45,112,179,0.32)';
+  for (const seg of segments) {
+    const [ccx, ccy] = mathToPixel(seg.centerX, seg.centerY, bounds);
+    const [tx, ty] = mathToPixel(seg.tipX, seg.tipY, bounds);
+    const pr = Math.abs(seg.r) * scale;
+    overlayCtx.beginPath();
+    overlayCtx.arc(ccx, ccy, pr, 0, Math.PI * 2);
+    overlayCtx.stroke();
+    overlayCtx.beginPath();
+    overlayCtx.moveTo(ccx, ccy);
+    overlayCtx.lineTo(tx, ty);
+    overlayCtx.stroke();
+  }
+  if (segments.length) {
+    const last = segments[segments.length - 1];
+    const [tx, ty] = mathToPixel(last.tipX, last.tipY, bounds);
+    overlayCtx.fillStyle = CURVE_COLOR;
+    overlayCtx.beginPath();
+    overlayCtx.arc(tx, ty, 3, 0, Math.PI * 2);
+    overlayCtx.fill();
+  }
+}
+
+function startFourierDrawAnimation() {
+  cancelDrawAnimation();
+  if (!calculator || currentFourierPaths.length === 0) return;
+  const myGen = drawGeneration;
+  const paths = currentFourierPaths;
+
+  // Longest-arc-length-first selection: top K get the full epicycle chain
+  // ("featured", drawn sequentially so each one's spin is legible), the rest
+  // trace ink-only, staggered concurrently across roughly the same window
+  // (brief: "可多条并行,只画笔迹不画圆圈").
+  const order = paths.map((_, i) => i).sort((a, b) => paths[b].arcLen - paths[a].arcLen);
+  const featuredIdx = order.slice(0, Math.min(order.length, FOURIER_FEATURED_COUNT));
+  const batchIdx = order.slice(featuredIdx.length);
+  const featuredTotalMs = featuredIdx.length * FOURIER_FEATURED_SLOT_MS;
+  const batchTarget = Math.max(featuredTotalMs, SWEEP_TOTAL_TARGET_MS);
+  const batchCount = batchIdx.length;
+  const batchInterval = batchCount > 0
+    ? Math.max(SWEEP_INTERVAL_FLOOR_MS, Math.min(SWEEP_INTERVAL_CEILING_MS, batchTarget / batchCount))
+    : 0;
+  const batchTimelineMs = batchCount > 0 ? (batchCount - 1) * batchInterval + SWEEP_DURATION_MS : 0;
+  const lineTimelineMs = Math.max(featuredTotalMs, batchTimelineMs, 1);
+
+  const numFills = currentFillPolygons.length;
+  const fillPhaseMs = numFills > 0 ? FILL_PHASE_TOTAL_MS : 0;
+  const fillInterval = numFills > 0 ? fillPhaseMs / numFills : 0;
+  const grandTotalMs = lineTimelineMs + fillPhaseMs;
+
+  resizeOverlayToCalculator();
+  drawOverlay.style.display = 'block';
+
+  let lastFrameTime = performance.now();
+  let animElapsedMs = 0;
+
+  function step() {
+    if (myGen !== drawGeneration) return;
+    const now = performance.now();
+    const dt = Math.min(now - lastFrameTime, MAX_FRAME_DT_MS);
+    lastFrameTime = now;
+    animElapsedMs += dt * speedMultiplier;
+
+    resizeOverlayToCalculator();
+    const bounds = calculator.graphpaperBounds;
+    overlayCtx.clearRect(0, 0, drawOverlay.width, drawOverlay.height);
+
+    // Fills phase: identical shape to startDrawAnimation's (same shared
+    // currentFillPolygons, same constants) -- fills are common to both modes.
+    const fillElapsedMs = animElapsedMs - lineTimelineMs;
+    if (numFills > 0 && fillElapsedMs > 0) {
+      const fillsRevealed = Math.min(numFills, Math.floor(fillElapsedMs / fillInterval) + 1);
+      overlayCtx.globalAlpha = 0.9;
+      for (let i = 0; i < fillsRevealed; i++) {
+        const poly = currentFillPolygons[i];
+        const pts = poly.points.map((p) => mathToPixel(p[0], p[1], bounds));
+        overlayCtx.fillStyle = poly.color;
+        overlayCtx.beginPath();
+        overlayCtx.moveTo(pts[0][0], pts[0][1]);
+        for (let k = 1; k < pts.length; k++) overlayCtx.lineTo(pts[k][0], pts[k][1]);
+        overlayCtx.closePath();
+        overlayCtx.fill();
+      }
+      overlayCtx.globalAlpha = 1;
+    }
+
+    overlayCtx.lineCap = 'round';
+    overlayCtx.lineJoin = 'round';
+
+    // Featured paths: sequential slots, full epicycle chain while actively
+    // spinning, ink held complete once its slot finishes.
+    for (let fi = 0; fi < featuredIdx.length; fi++) {
+      const fp = paths[featuredIdx[fi]];
+      const winStart = fi * FOURIER_FEATURED_SLOT_MS;
+      const p = Math.max(0, Math.min(1, (animElapsedMs - winStart) / FOURIER_FEATURED_SLOT_MS));
+      if (p <= 0) continue;
+      drawFourierInkTrace(fp, bounds, p);
+      if (p < 1) drawEpicycleChain(fp, bounds, p * fp.tMax);
+    }
+
+    // Batch paths: ink-only, staggered concurrently.
+    for (let bi = 0; bi < batchIdx.length; bi++) {
+      const fp = paths[batchIdx[bi]];
+      const start = bi * batchInterval;
+      const p = Math.max(0, Math.min(1, (animElapsedMs - start) / SWEEP_DURATION_MS));
+      if (p <= 0) continue;
+      drawFourierInkTrace(fp, bounds, p);
+    }
+
+    const pct = Math.floor(Math.min(100, (animElapsedMs / grandTotalMs) * 100));
+    statsEl.innerHTML = lastStatsHtml + STATS_SEP + '[>] 绘制中… ' + pct + '%';
+
+    if (animElapsedMs < grandTotalMs) {
+      drawRafId = requestAnimationFrame(step);
+    } else {
+      // Final commit: bulk-unhide, same "overlay already shows the finished
+      // picture, so however long setState takes is invisible" pattern as
+      // startDrawAnimation's finale (duplicated rather than shared so this
+      // new code path can never perturb the already-verified Bezier one).
+      const finalFillExpressions = currentFillPolygons.map((poly, i) => ({
+        id: 'fill-' + i,
+        type: 'expression',
+        color: poly.color,
+        fillOpacity: currentFillOpacity,
+        lineOpacity: currentFillOpacity === '1' ? '1' : '0', // fine mode: self-colored border seals hairline cracks between adjacent quantized regions
+        lineWidth: '2.5',
+        hidden: false,
+        latex: '\\operatorname{polygon}\\left(' + poly.points.map((p) => '\\left(' + fmtNum(p[0]) + ',' + fmtNum(p[1]) + '\\right)').join(',') + '\\right)',
+      }));
+      const finalExpressions = paths.map((fp, i) => ({
+        id: 'four-' + i,
+        type: 'expression',
+        color: CURVE_COLOR,
+        hidden: false,
+        latex: fourierPathLatex(fp.dc, fp.harmonics),
+      }));
+      const commitStart = performance.now();
+      const state = calculator.getState();
+      state.expressions.list = finalFillExpressions.concat(finalExpressions);
+      calculator.setState(state);
+      window.__lastCommitMs = Math.round(performance.now() - commitStart);
+      drawRafId = null;
+
+      let overlayReleased = false;
+      const releaseOverlay = () => {
+        if (overlayReleased || myGen !== drawGeneration) return;
+        overlayReleased = true;
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          if (myGen !== drawGeneration) return;
+          drawOverlay.style.display = 'none';
+          overlayCtx.clearRect(0, 0, drawOverlay.width, drawOverlay.height);
+          statsEl.innerHTML = lastStatsHtml;
+        }));
+      };
+      const graceMs = Math.max(1500, window.__lastCommitMs * 4);
+      window.__lastPaintBarrier = 'adaptive-' + graceMs + 'ms';
+      setTimeout(releaseOverlay, graceMs);
+    }
+  }
+  drawRafId = requestAnimationFrame(step);
+}
+
+drawBtn.addEventListener('click', () => {
+  if (fourierMode) startFourierDrawAnimation(); else startDrawAnimation();
+});
+let isRendering = false;
+
+function yieldToUI() {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+thresholdSlider.addEventListener('input', () => { thresholdVal.textContent = thresholdSlider.value; });
+toleranceSlider.addEventListener('input', () => { toleranceVal.textContent = Number(toleranceSlider.value).toFixed(1); });
+harmonicsSlider.addEventListener('input', () => { harmonicsVal.textContent = harmonicsSlider.value; });
+maxCurvesSlider.addEventListener('input', () => { maxCurvesVal.textContent = maxCurvesSlider.value; });
+speedSlider.addEventListener('input', () => {
+  speedMultiplier = Number(speedSlider.value);
+  speedVal.textContent = speedMultiplier.toFixed(1);
+});
+
+fileInput.addEventListener('change', () => {
+  if (fileInput.files && fileInput.files[0]) handleFile(fileInput.files[0]);
+});
+
+renderBtn.addEventListener('click', () => { render(); });
+
+let dragDepth = 0;
+window.addEventListener('dragenter', (e) => {
+  e.preventDefault();
+  dragDepth++;
+  document.body.classList.add('dragging');
+});
+window.addEventListener('dragover', (e) => { e.preventDefault(); });
+window.addEventListener('dragleave', (e) => {
+  e.preventDefault();
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) document.body.classList.remove('dragging');
+});
+window.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dragDepth = 0;
+  document.body.classList.remove('dragging');
+  const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (file) handleFile(file);
+});
+
+function loadImageFile(file) {
+  return new Promise((resolve, reject) => {
+    if (!file.type || file.type.indexOf('image/') !== 0) {
+      reject(new Error('Not an image file'));
+      return;
+    }
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Failed to decode image')); };
+    img.src = url;
+  });
+}
+
+async function handleFile(file) {
+  statsEl.classList.remove('err');
+  statsEl.textContent = '[+] 加载图片中…';
+  try {
+    const img = await loadImageFile(file);
+    let w = img.naturalWidth, h = img.naturalHeight;
+    if (w === 0 || h === 0) throw new Error('Image has no pixels');
+    const maxDim = Math.max(w, h);
+    let upscaled = false;
+    if (maxDim > 1000) {
+      const scale = 1000 / maxDim;
+      w = Math.max(1, Math.round(w * scale));
+      h = Math.max(1, Math.round(h * scale));
+    } else if (maxDim < 500) {
+      upscaled = true;
+      // Tiny sources (small downloaded portraits): upscale so edge tracing and
+      // fill boundaries work at sub-source-pixel smoothness instead of
+      // staircasing. Gate at 500 keeps every existing test asset (>=600px)
+      // byte-identical through the pipeline.
+      const scale = 900 / maxDim;
+      w = Math.max(1, Math.round(w * scale));
+      h = Math.max(1, Math.round(h * scale));
+    }
+    const off = document.createElement('canvas');
+    off.width = w; off.height = h;
+    const octx = off.getContext('2d');
+    if (upscaled) {
+      // High-quality resampling ONLY for the upscale branch. Setting it
+      // unconditionally changes the downscale path's pixel output and shifted
+      // every baseline curve count (caught by the regression suite) -- the
+      // browser default ('low') is part of the pipeline's frozen behavior.
+      octx.imageSmoothingEnabled = true;
+      octx.imageSmoothingQuality = 'high';
+    }
+    octx.drawImage(img, 0, 0, w, h);
+    currentImageData = octx.getImageData(0, 0, w, h);
+    sourceCanvas.width = w;
+    sourceCanvas.height = h;
+    sourceCanvas.getContext('2d').drawImage(off, 0, 0);
+    sourceSection.hidden = false;
+    previewWrap.hidden = false;
+    renderBtn.disabled = false;
+    await render();
+  } catch (err) {
+    console.error(err);
+    statsEl.classList.add('err');
+    statsEl.textContent = '[x] 加载图片出错: ' + err.message;
+  }
+}
+
+function drawPreview(beziers, width, height) {
+  previewCanvas.width = width;
+  previewCanvas.height = height;
+  const ctx = previewCanvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, width, height);
+  ctx.strokeStyle = CURVE_COLOR;
+  ctx.lineWidth = Math.max(1, Math.min(width, height) / 400);
+  ctx.beginPath();
+  for (const bez of beziers) {
+    ctx.moveTo(bez[0][0], bez[0][1]);
+    ctx.bezierCurveTo(bez[1][0], bez[1][1], bez[2][0], bez[2][1], bez[3][0], bez[3][1]);
+  }
+  ctx.stroke();
+}
+
+// Fourier-mode counterpart of drawPreview: draws the reconstructed curves
+// (dense samples precomputed in render()) into #previewCanvas. Used both for
+// the normal collapsible "图 2. 拟合曲线" panel AND, unchanged, for the
+// Desmos-load-failure degrade mode (showDesmosFailureNotice just resizes/
+// expands the same canvas -- this function doesn't know or care which case
+// it's in, matching drawPreview's existing behavior for Bezier mode).
+// fp.samples are stored in MATH space (y-up, see flipHarmonicsY); flipping
+// back once here (the transform is its own inverse) gives plain image-pixel
+// space for this y-down 2D canvas -- exactly mirroring how drawPreview
+// consumes `allBeziers` in its original, pre-flip pixel space.
+function drawFourierPreview(fourierPaths, width, height) {
+  previewCanvas.width = width;
+  previewCanvas.height = height;
+  const ctx = previewCanvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, width, height);
+  ctx.strokeStyle = CURVE_COLOR;
+  ctx.lineWidth = Math.max(1, Math.min(width, height) / 400);
+  ctx.beginPath();
+  for (const fp of fourierPaths) {
+    const pts = fp.samples;
+    if (pts.length === 0) continue;
+    ctx.moveTo(pts[0][0], height - pts[0][1]);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], height - pts[i][1]);
+  }
+  ctx.stroke();
+}
+
+// Desmos does NOT keep x/y scales equal: forcing the raw image bounds into a
+// graph paper of a different pixel aspect squashes the drawing (tall image in
+// a wide window renders vertically compressed / "fat"). Expand ONE math axis
+// (never shrink) so the viewport aspect matches the graph paper pixel aspect.
+function aspectCorrectViewport(viewport) {
+  try {
+    const pc = calculator.graphpaperBounds.pixelCoordinates;
+    if (!pc || !pc.width || !pc.height) return viewport;
+    const pAspect = pc.width / pc.height;
+    let { left, right, bottom, top } = viewport;
+    const mw = right - left, mh = top - bottom;
+    if (mw / mh < pAspect) {
+      const nw = mh * pAspect, cx = (left + right) / 2;
+      left = cx - nw / 2; right = cx + nw / 2;
+    } else {
+      const nh = mw / pAspect, cy = (top + bottom) / 2;
+      bottom = cy - nh / 2; top = cy + nh / 2;
+    }
+    return { left, right, bottom, top };
+  } catch (e) {
+    return viewport;
+  }
+}
+
+function renderToDesmos(expressions, viewport) {
+  const vp = aspectCorrectViewport(viewport);
+  const state = calculator.getState();
+  state.expressions.list = expressions;
+  state.graph = state.graph || {};
+  state.graph.viewport = vp;
+  calculator.setState(state);
+  // Desmos's initial layout pass clobbers the viewport if setState runs
+  // before the first layout settles (fresh page + immediate render), so
+  // pin it explicitly, and once more after the layout pass (re-correct with
+  // the settled graph paper aspect, which may differ pre-layout).
+  calculator.setMathBounds(vp);
+  setTimeout(() => calculator.setMathBounds(aspectCorrectViewport(viewport)), 400);
+}
+
+async function render() {
+  if (!currentImageData || isRendering) return;
+  isRendering = true;
+  renderBtn.disabled = true;
+  drawBtn.disabled = true;
+  cancelDrawAnimation(); // a fresh render replaces the whole curve set — any in-flight draw-in is now stale
+  const t0 = performance.now();
+  statsEl.classList.remove('err');
+  statsEl.textContent = '[+] 处理中…';
+  try {
+    const { width, height, data } = currentImageData;
+    const high = Number(thresholdSlider.value);
+    const low = high * 0.4;
+    const maxError = Number(toleranceSlider.value);
+    const maxCurves = Number(maxCurvesSlider.value);
+    const harmonicCount = Number(harmonicsSlider.value);
+
+    await yieldToUI();
+    const gray = toGrayscale(data, width, height);
+    await yieldToUI();
+    const blurred = gaussianBlur5(gray, width, height);
+    await yieldToUI();
+    const sobelRes = sobel(blurred, width, height);
+    await yieldToUI();
+    const nms = nonMaxSuppression(sobelRes.mag, sobelRes.dir, width, height);
+    await yieldToUI();
+    const edgeRaw = doubleThresholdHysteresis(nms, width, height, high, low);
+    await yieldToUI();
+    const edge = guoHallThin(edgeRaw, width, height);
+    await yieldToUI();
+
+    let edgeCount = 0;
+    for (let i = 0; i < edge.length; i++) if (edge[i] === 255) edgeCount++;
+
+    // Trace with a low internal threshold so short-but-real fragments survive
+    // to be gap-linked, then apply the real minimum length after linking —
+    // otherwise minLength=8 would discard exactly the tiny pieces gap-linking
+    // needs to reassemble into a full contour. Tracing, linking, and the
+    // length filter together cost single-digit milliseconds even on a dense
+    // 1000px image (profiled), so they share one yield rather than each
+    // paying rAF's per-call latency for negligible chunking benefit.
+    const rawPaths = traceContours(edge, width, height, 1);
+    // gap/angle/minLength retuned after switching to sub-pixel NMS: the old
+    // values (20, 35, 8) were tuned against quantized-NMS fragmentation and
+    // over-linked/over-kept short pieces once the edge map itself became far
+    // less fragmented (demo-dragon-v2: 4838 connected components -> 131).
+    const linkedPaths = linkPathGaps(rawPaths, 10, 30, width, height);
+    function pathArcLength(p) {
+      let l = 0;
+      for (let i = 1; i < p.length; i++) l += Math.hypot(p[i][0] - p[i - 1][0], p[i][1] - p[i - 1][1]);
+      return l;
+    }
+    const paths = linkedPaths.filter((p) => pathArcLength(p) >= 30);
+    await yieldToUI();
+
+    // Branch point (brief: "傅里叶分叉在轮廓追踪+桥接后的像素级路径"): `paths` above
+    // is shared by both modes unchanged. Bezier does RDP simplify + Schneider
+    // fitCurve on it (unchanged from before this feature existed); Fourier
+    // resamples the DENSE pre-RDP points directly (RDP's sparse vertices
+    // would starve uniform arc-length resampling of real detail). Declared
+    // here so both branches can populate them and the shared tail below
+    // (fill pipeline, preview, Desmos push, stats, animation trigger) can
+    // read whichever one applies.
+    let allBeziers = [];
+    let capped = false;
+    let expressions = [];
+    let fourierHarmonicTotal = 0;
+
+    if (!fourierMode) {
+      let lastYield = performance.now();
+      let bezColors = []; // parallel to allBeziers; per-path sampled ink in fine mode
+      outer:
+      for (let pi = 0; pi < paths.length; pi++) {
+        if (allBeziers.length >= maxCurves) break;
+        const simplified = rdpSimplify(paths[pi], 0.8);
+        if (simplified.length >= 2) {
+          const pathColor = fineFillEnabled ? sampleLineColor(paths[pi], data, width) : CURVE_COLOR;
+          const beziers = fitCurve(simplified, maxError);
+          for (const b of beziers) {
+            allBeziers.push(b);
+            bezColors.push(pathColor);
+            if (allBeziers.length >= maxCurves) break outer;
+          }
+        }
+        if (performance.now() - lastYield > 40) {
+          await yieldToUI();
+          lastYield = performance.now();
+        }
+      }
+      capped = allBeziers.length >= maxCurves && paths.length > 0;
+
+      // Draw-in animation flows top to bottom: order curves by their topmost
+      // control point (Bezier's convex-hull property means the curve itself
+      // never rises above the min-y of its own control points, so this is a
+      // safe, cheap ordering key without sampling the curve). Order only
+      // affects animation sequencing, not the static final picture.
+      const order = allBeziers.map((_, i) => i).sort((ia, ib) => {
+        const a = allBeziers[ia], b = allBeziers[ib];
+        const topA = Math.min(a[0][1], a[1][1], a[2][1], a[3][1]);
+        const topB = Math.min(b[0][1], b[1][1], b[2][1], b[3][1]);
+        return topA - topB;
+      });
+      allBeziers = order.map((i) => allBeziers[i]);
+      bezColors = order.map((i) => bezColors[i]);
+      // Only fine mode publishes per-curve colors; standard mode leaves this
+      // empty so every consumer (overlay stroke, final commit, lineWidth
+      // gates) falls back to the original CURVE_COLOR/2.5 behavior.
+      currentCurveColors = fineFillEnabled ? bezColors : [];
+
+      // Flip y (image coords -> math coords) so the drawing is upright in
+      // Desmos. Every curve starts hidden -- the real drawing happens on the
+      // canvas overlay (startDrawAnimation), which sweeps currentMathBeziers
+      // top-to-bottom (matching the sort above) and only touches Desmos once
+      // more, at the very end, to bulk-unhide everything.
+      const n = allBeziers.length;
+      const mathBeziers = allBeziers.map((bez) => [
+        [bez[0][0], height - bez[0][1]],
+        [bez[1][0], height - bez[1][1]],
+        [bez[2][0], height - bez[2][1]],
+        [bez[3][0], height - bez[3][1]],
+      ]);
+      currentMathBeziers = mathBeziers;
+      currentFourierPaths = []; // stale Fourier state from a previous mode must not leak into this render
+      expressions = mathBeziers.map((bez, i) => ({
+        id: 'bez-' + i,
+        type: 'expression',
+        color: bezColors[i] || CURVE_COLOR,
+        lineWidth: fineFillEnabled ? '1.75' : undefined, // fine: thinner ink so small features (eyes) aren't swallowed; undefined -> Desmos default (standard mode unchanged)
+        hidden: true,
+        latex: segmentLatex(bez[0], bez[1], bez[2], bez[3]),
+      }));
+    } else {
+      currentMathBeziers = [];
+      currentCurveCount = 0; // stale Bezier state from a previous mode must not leak into this render
+      currentCurveColors = [];
+      // Path-level cap: minLength(30px) already keeps path counts small on
+      // every test image (max observed ~86 on demo-dragon-v2), nowhere near
+      // where a maxCurves-style cap would matter -- "曲线上限" stays a
+      // Bezier-only control (brief only calls out hiding 容差, not repurposing
+      // this slider), left visible but inert in Fourier mode.
+      const CLOSE_THRESHOLD_FRAC = 0.02; // endpoints within 2% of the path's own arc length (min 4px) count as already closed
+      const fourierPaths = [];
+      for (const p of paths) {
+        const arcLen = pathArcLength(p);
+        const closeThresholdPx = Math.max(4, arcLen * CLOSE_THRESHOLD_FRAC);
+        const closed = isPathClosed(p, closeThresholdPx);
+        const M = chooseResampleCount(arcLen);
+        const resampled = resamplePathUniform(p, M);
+        const loopPoints = closed ? resampled : mirrorClosePath(resampled);
+        const { dc: dcPixel, harmonics: harmonicsPixel } = topHarmonics(complexDFT(loopPoints), harmonicCount);
+        // Animation-only cutoff: for a mirrored open path, t in [0, tMax]
+        // traces the forward pass once; t in [tMax, 1] retraces it backward
+        // over already-drawn ink (brief: avoid drawing it twice). A closed
+        // path has no mirrored half, so its whole loop is "new" (tMax=1).
+        const tMax = closed ? 1 : M / loopPoints.length;
+        // Flip to math space (y-up) once here -- see flipHarmonicsY's
+        // derivation comment -- so the Desmos latex, the overlay animation,
+        // and the preview canvas all share one MATH-space source of truth,
+        // matching how the Bezier branch flips once into currentMathBeziers.
+        const { dc, harmonics } = flipHarmonicsY(dcPixel, harmonicsPixel, height);
+        const samples = reconstructPath(dc, harmonics, FOURIER_SAMPLE_COUNT, tMax);
+        fourierPaths.push({ dc, harmonics, tMax, arcLen, samples });
+      }
+      currentFourierPaths = fourierPaths;
+      fourierHarmonicTotal = fourierPaths.reduce((sum, fp) => sum + fp.harmonics.length, 0);
+      expressions = fourierPaths.map((fp, i) => ({
+        id: 'four-' + i,
+        type: 'expression',
+        color: CURVE_COLOR,
+        hidden: true,
+        latex: fourierPathLatex(fp.dc, fp.harmonics),
+      }));
+    }
+
+    // Color fill (填色): independent of the edge/curve pipeline above, runs
+    // directly on the raw image data. Gated by the toolbar toggle -- when
+    // off, fillPolygons stays empty and every downstream step (expressions,
+    // stats line, final commit) is identical to the no-fill code path.
+    let fillPolygons = [];
+    let fillStats = null;
+    currentFillOpacity = fineFillEnabled ? '1' : '0.9';
+    if (fillEnabled) {
+      // Fine params: 32 colors resolves anime shading gradients into cel-like
+      // bands (14 crushes them); minArea 14 keeps eyes/small ornaments at
+      // portrait scale; whiteThreshold 256 disables whiteness exclusion
+      // entirely (background removal is the flood mask's job in fine mode);
+      // opacity 1 because posterized portraits need solid coverage -- 0.9
+      // leaks the grid through every fill.
+      const fillOpts = fineFillEnabled
+        ? { fine: true, numColors: 32, minAreaPx: 14, whiteThreshold: 256, blackThreshold: 8, rdpEpsilon: 1.0, maxPolygons: 2000 }
+        : {};
+      const fillResult = extractFillPolygons(data, width, height, fillOpts);
+      fillPolygons = fillResult.polygons;
+      fillStats = fillResult.stats;
+      // Same top-to-bottom convention as the curve sort above (by topmost
+      // point, pre-flip, in image coords) so the fill-in phase flows the
+      // same visual direction as the line sweep instead of switching to a
+      // different scan order.
+      fillPolygons.sort((a, b) => {
+        const topA = Math.min(...a.points.map((p) => p[1]));
+        const topB = Math.min(...b.points.map((p) => p[1]));
+        return topA - topB;
+      });
+    }
+    // Same y-flip as curves; fills share the identical math coordinate space.
+    currentFillPolygons = fillPolygons.map((poly) => ({
+      color: poly.color,
+      points: poly.points.map(([x, y]) => [x, height - y]),
+    }));
+    // Fill expressions are placed BEFORE the curve expressions in the list --
+    // confirmed live that Desmos draws later list entries on top, so this
+    // ordering is what keeps fills under the line work, not a cosmetic choice.
+    const fillExpressions = currentFillPolygons.map((poly, i) => ({
+      id: 'fill-' + i,
+      type: 'expression',
+      color: poly.color,
+      fillOpacity: currentFillOpacity, // setState requires a string here -- see the matching comment at the final-commit call site
+      lineOpacity: currentFillOpacity === '1' ? '1' : '0',
+      lineWidth: '2.5',
+      hidden: true,
+      latex: '\\operatorname{polygon}\\left(' + poly.points.map((p) => '\\left(' + fmtNum(p[0]) + ',' + fmtNum(p[1]) + '\\right)').join(',') + '\\right)',
+    }));
+
+    // Desmos's setState only honors {left,right,bottom,top} for graph.viewport —
+    // {xmin,xmax,ymin,ymax} is silently ignored (confirmed against the live API;
+    // it does not throw, it just leaves the viewport at its default).
+    const marginX = width * 0.08, marginY = height * 0.08;
+    const viewport = { left: -marginX, right: width + marginX, bottom: -marginY, top: height + marginY };
+
+    if (fourierMode) {
+      drawFourierPreview(currentFourierPaths, width, height);
+    } else {
+      drawPreview(allBeziers, width, height);
+    }
+
+    if (calculator) {
+      renderToDesmos(fillExpressions.concat(expressions), viewport);
+    }
+
+    const ms = Math.round(performance.now() - t0);
+    const SEP = STATS_SEP;
+    let statsHtml = fourierMode
+      ? '[+] ' + currentFourierPaths.length + ' 路径' + SEP +
+        '[+] ' + fourierHarmonicTotal + ' 谐波总数' + SEP +
+        '[t] ' + ms + 'ms'
+      : '[+] ' + edgeCount + ' 边缘像素' + SEP +
+        '[+] ' + paths.length + ' 路径' + SEP +
+        '[+] ' + allBeziers.length + ' 曲线' + SEP +
+        '[t] ' + ms + 'ms';
+    if (fillEnabled) {
+      statsHtml += SEP + '[+] ' + fillPolygons.length + ' 填色';
+      // regionsCapped specifically means the maxPolygons budget was hit --
+      // NOT the same as (regionsAfterFilter > polygonCount), which also
+      // trips on the rare degenerate-boundary case (a kept region traces to
+      // under 3 points and gets skipped) and would misreport that as a cap.
+      if (fillStats.regionsCapped > 0) {
+        statsHtml += SEP + '<span class="cap">[!] 填色已截断至 ' + fillPolygons.length + '</span>';
+      }
+    }
+    if (!fourierMode && capped) statsHtml += SEP + '<span class="cap">[!] 已截断至 ' + maxCurves + '</span>';
+    lastStatsHtml = statsHtml;
+    statsEl.innerHTML = statsHtml;
+
+    if (fourierMode) {
+      if (calculator && currentFourierPaths.length > 0) {
+        drawBtn.disabled = false;
+        startFourierDrawAnimation();
+      }
+    } else if (calculator && allBeziers.length > 0) {
+      currentCurveCount = allBeziers.length;
+      drawBtn.disabled = false;
+      startDrawAnimation();
+    } else {
+      currentCurveCount = 0;
+    }
+  } catch (err) {
+    console.error(err);
+    statsEl.classList.add('err');
+    statsEl.textContent = '[x] 出错: ' + err.message;
+  } finally {
+    isRendering = false;
+    renderBtn.disabled = false;
+  }
+}
+
+/* =========================================================================
+ * Desmos bootstrap with a robust, timeout-guarded fallback to the canvas
+ * preview if the API script fails to load or errors on construction.
+ * ========================================================================= */
+
+function waitForDesmos(timeoutMs) {
+  return new Promise((resolve) => {
+    const start = performance.now();
+    (function poll() {
+      if (window.__desmosLoaded && typeof Desmos !== 'undefined') { resolve(true); return; }
+      if (window.__desmosFailed) { resolve(false); return; }
+      if (performance.now() - start > timeoutMs) { resolve(false); return; }
+      setTimeout(poll, 100);
+    })();
+  });
+}
+
+function showDesmosFailureNotice() {
+  document.getElementById('calculator').style.display = 'none';
+  previewWrap.classList.add('large');
+  previewWrap.hidden = false;
+  setCurveCollapsed(false);
+}
+
+// Found during testing: collapsing/expanding the expression panel (or any
+// other resize of #calculator) can leave Desmos's own WebGL canvas
+// blank -- the internal state is correct (confirmed: hidden flags and
+// graphpaperBounds are all right immediately after), but the graph simply
+// doesn't repaint at the new size until something else nudges it. A no-op
+// setMathBounds() call (same value back in) is enough to force that
+// repaint, so just do it on every #calculator resize rather than trying to
+// special-case the panel's own toggle buttons.
+function forceDesmosRepaint() {
+  if (!calculator) return;
+  const b = calculator.graphpaperBounds.mathCoordinates;
+  calculator.setMathBounds({ left: b.left, right: b.right, bottom: b.bottom, top: b.top });
+}
+
+async function initDesmos() {
+  const available = await waitForDesmos(6000);
+  if (!available) { showDesmosFailureNotice(); return; }
+  try {
+    calculator = Desmos.GraphingCalculator(document.getElementById('calculator'), {
+      settingsMenu: true,
+      keypad: false,
+    });
+    new ResizeObserver(() => forceDesmosRepaint()).observe(calculatorEl);
+  } catch (err) {
+    console.error('Desmos construction failed', err);
+    calculator = null;
+    showDesmosFailureNotice();
+  }
+}
+
+initDesmos();
+</script>
+</body>
+</html>
