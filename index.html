@@ -38,7 +38,7 @@
   #toolbar input[type="range"] { width: 90px; vertical-align: middle; accent-color: #201d1d; }
   #toolbar .val { color: #201d1d; font-variant-numeric: tabular-nums; }
 
-  #fileLabel, #renderBtn, #drawBtn, #fillToggleBtn, #fourierToggleBtn, #fineFillBtn {
+  #fileLabel, #renderBtn, #drawBtn, #videoPlayBtn, #fillToggleBtn, #fourierToggleBtn, #fineFillBtn {
     cursor: pointer; font-family: inherit;
     height: 36px; padding: 4px 20px;
     display: inline-flex; align-items: center;
@@ -46,8 +46,8 @@
     background: #201d1d; color: #fdfcfc;
     font-weight: 500; font-size: 14px;
   }
-  #fileLabel:hover, #renderBtn:hover, #drawBtn:hover { background: #424245; }
-  #renderBtn:disabled, #drawBtn:disabled { background: #9a9898; cursor: not-allowed; }
+  #fileLabel:hover, #renderBtn:hover, #drawBtn:hover, #videoPlayBtn:hover { background: #424245; }
+  #renderBtn:disabled, #drawBtn:disabled, #videoPlayBtn:disabled { background: #9a9898; cursor: not-allowed; }
   #fileInput { display: none; }
   /* Toggle, not an action button: pressed (on) matches the solid primary
      style; unpressed (off) hollows out to signal "inactive" without a
@@ -62,6 +62,9 @@
   #stats { margin-left: auto; color: #646262; font-variant-numeric: tabular-nums; white-space: nowrap; }
   #stats.err { color: #ff3b30; }
   #stats .cap { color: #ff9f0a; }
+  #videoControls { display: flex; align-items: center; gap: 16px; }
+  #videoControls[hidden] { display: none; }
+  #frameSlider { width: 160px; }
 
   #main { position: relative; flex: 1 1 auto; min-height: 0; background: #fdfcfc; }
   #calculator { position: absolute; inset: 0; z-index: 1; background: #fdfcfc; }
@@ -126,10 +129,10 @@
 <div id="toolbar">
   <div id="wordmark"></div>
   <div id="controls">
-    <label id="fileLabel" for="fileInput">选择图片
-      <input id="fileInput" type="file" accept="image/*">
+    <label id="fileLabel" for="fileInput">选择媒体
+      <input id="fileInput" type="file" accept="image/*,video/mp4,video/webm">
     </label>
-    <span id="hint">[+] 拖入图片即可</span>
+    <span id="hint">[+] 拖入图片或视频即可</span>
 
     <label>阈值
       <input id="thresholdSlider" type="range" min="10" max="300" step="1" value="60">
@@ -161,6 +164,13 @@
     <button id="fourierToggleBtn" aria-pressed="false">[~] 傅里叶</button>
     <button id="renderBtn" disabled>渲染</button>
     <button id="drawBtn" disabled>[&gt;] 绘制</button>
+    <div id="videoControls" hidden>
+      <button id="videoPlayBtn" disabled>[&gt;] 播放</button>
+      <label>帧
+        <input id="frameSlider" type="range" min="0" max="0" step="1" value="0">
+        <span class="val">[<span id="frameVal">1/1</span>]</span>
+      </label>
+    </div>
   </div>
 
   <span id="stats">[+] 先载入一张图片</span>
@@ -183,7 +193,7 @@
   </div>
 </div>
 
-<div id="dropOverlay"><span>[+] 拖入图片即可</span></div>
+<div id="dropOverlay"><span>[+] 拖入图片或视频即可</span></div>
 
 <script>
 'use strict';
@@ -847,6 +857,100 @@ function epicycleChain(dc, harmonics, t) {
  * of it.
  * ========================================================================= */
 
+// Uniform leading-window sampling. HTMLVideoElement does not expose a
+// reliable source FPS, so time is the source of truth: sample at no more than
+// targetFps and stop after maxFrames. A capped plan intentionally represents
+// the first N frames, matching the product's explicit long-video behavior.
+function planVideoSamples(durationSeconds, targetFps, maxFrames) {
+  const fps = Math.max(0.01, Number(targetFps) || 12);
+  const cap = Math.max(1, Math.floor(Number(maxFrames) || 120));
+  const duration = Math.max(0, Number(durationSeconds) || 0);
+  const available = Math.max(1, Math.ceil(duration * fps));
+  const count = Math.min(cap, available);
+  const times = [];
+  for (let i = 0; i < count; i++) times.push(Math.min(duration, i / fps));
+  return { times, fps, truncated: available > cap, availableFrames: available };
+}
+
+// GIF delays are stored in centiseconds, so an exact 12fps interval
+// (83.333ms) is not representable. Quantize the target to the nearest 10ms
+// before selecting by cumulative frame durations. For the common 80ms GIF
+// cadence this yields an 80ms target and preserves every source frame instead
+// of phase-dropping frames against a synthetic continuous timestamp grid.
+function planGifSamples(frameDurationsUs, targetFps, maxFrames) {
+  const fps = Math.max(0.01, Number(targetFps) || 12);
+  const cap = Math.max(1, Math.floor(Number(maxFrames) || 120));
+  const intervalUs = Math.max(10000, Math.round((1000000 / fps) / 10000) * 10000);
+  const indices = [];
+  let timelineUs = 0;
+  let nextSampleUs = 0;
+  for (let i = 0; i < frameDurationsUs.length; i++) {
+    if (i === 0 || timelineUs + 1 >= nextSampleUs) {
+      indices.push(i);
+      while (nextSampleUs <= timelineUs + 1) nextSampleUs += intervalUs;
+      if (indices.length >= cap) break;
+    }
+    const durationUs = Number(frameDurationsUs[i]);
+    timelineUs += Number.isFinite(durationUs) && durationUs > 0 ? durationUs : 100000;
+  }
+  return {
+    indices,
+    intervalUs,
+    truncated: indices.length >= cap && indices[indices.length - 1] < frameDurationsUs.length - 1,
+  };
+}
+
+function advanceVideoPlayback(index, accumulatorMs, elapsedMs, speed, fps, frameCount) {
+  const count = Math.max(1, Math.floor(frameCount));
+  const stepMs = 1000 / Math.max(0.01, fps);
+  let accumulator = accumulatorMs + Math.min(250, Math.max(0, elapsedMs)) * Math.max(0, speed);
+  let nextIndex = index;
+  while (accumulator + 1e-9 >= stepMs) {
+    accumulator -= stepMs;
+    nextIndex = (nextIndex + 1) % count;
+  }
+  if (Math.abs(accumulator) < 1e-9) accumulator = 0;
+  return { index: nextIndex, accumulatorMs: accumulator };
+}
+
+function assignPaletteLabels(data, palette) {
+  const labels = new Int32Array(Math.floor(data.length / 4));
+  for (let i = 0; i < labels.length; i++) {
+    const o = i * 4;
+    if (data[o + 3] < 16) { labels[i] = -1; continue; }
+    const r = data[o], g = data[o + 1], b = data[o + 2];
+    let best = 0, bestD = Infinity;
+    for (let p = 0; p < palette.length; p++) {
+      const dr = r - palette[p].r, dg = g - palette[p].g, db = b - palette[p].b;
+      const d = dr * dr + dg * dg + db * db;
+      if (d < bestD) { bestD = d; best = p; }
+    }
+    labels[i] = best;
+  }
+  return labels;
+}
+
+// Build one palette from a bounded, evenly-spaced pixel sample across a frame
+// subset. The cap keeps memory stable even when 120 decoded 600px frames are
+// supplied; quantizeColors still performs the exact existing histogram merge.
+function buildSharedPalette(frameDataList, numColors, satAware, maxSamplePixels) {
+  const frames = frameDataList.filter((data) => data && data.length >= 4);
+  if (frames.length === 0) return [];
+  const cap = Math.max(numColors, maxSamplePixels || 120000);
+  const perFrame = Math.max(1, Math.floor(cap / frames.length));
+  const samples = [];
+  for (const data of frames) {
+    const pixels = Math.floor(data.length / 4);
+    const take = Math.min(pixels, perFrame);
+    const stride = pixels / take;
+    for (let i = 0; i < take; i++) {
+      const o = Math.min(pixels - 1, Math.floor(i * stride)) * 4;
+      samples.push(data[o], data[o + 1], data[o + 2], data[o + 3]);
+    }
+  }
+  return quantizeColors(new Uint8ClampedArray(samples), samples.length / 4, 1, numColors, satAware).palette;
+}
+
 // Coarse histogram -> agglomerative merge down to numColors. Clustering the
 // (few) histogram buckets rather than the (many) pixels directly keeps this
 // fast regardless of image size.
@@ -1149,9 +1253,16 @@ function extractFillPolygons(data, width, height, opts) {
   const {
     numColors = 14, minAreaPx = 60, whiteThreshold = 235, blackThreshold = 25,
     rdpEpsilon = 1.8, vertexCap = 360, maxPolygons = 800, fine = false,
+    fixedPalette = null, usePaletteColors = false,
   } = opts || {};
   const t0 = performance.now();
-  let { labels, palette } = quantizeColors(data, width, height, numColors, fine);
+  let palette, labels;
+  if (fixedPalette && fixedPalette.length) {
+    palette = fixedPalette;
+    labels = assignPaletteLabels(data, palette);
+  } else {
+    ({ labels, palette } = quantizeColors(data, width, height, numColors, fine));
+  }
   const tQuantize = performance.now();
   // Fine mode (soft-shaded / photographic art): speckle cleanup + component-
   // level background removal instead of label-level color exclusion, so
@@ -1184,7 +1295,7 @@ function extractFillPolygons(data, width, height, opts) {
     if (simplified.length < 3) simplified = boundary;
     simplified = downsampleToVertexCap(simplified, vertexCap);
     let color;
-    if (fine) {
+    if (fine && !usePaletteColors) {
       // True mean of the component's own pixels, not the palette entry: the
       // agglomerative merge dilutes saturated accents into their absorbing
       // cluster's average, so palette color systematically under-saturates.
@@ -1547,6 +1658,132 @@ function sampleLineColor(path, data, width) {
   return fillColorHex({ r: (r / n) * k, g: (g / n) * k, b: (b / n) * k });
 }
 
+// Pure frame vectorization entry point shared by static images and video.
+// It deliberately owns only deterministic pixel-to-vector work: UI yielding,
+// previews, Desmos state, and animation globals remain in render(). Keeping
+// the exact constants and ordering from the original render() body is what
+// makes this extraction a behavior-preserving refactor for static images.
+function vectorizeFrame(imageData, opts) {
+  const { width, height, data } = imageData;
+  const {
+    high = 60,
+    maxError = 2,
+    maxCurves = 4000,
+    mode = 'bezier',
+    harmonicCount = 40,
+    fillEnabled = true,
+    fineFillEnabled = false,
+    fourierSampleCount = 240,
+    sharedPalette = null,
+  } = opts || {};
+  const low = high * 0.4;
+
+  const gray = toGrayscale(data, width, height);
+  const blurred = gaussianBlur5(gray, width, height);
+  const sobelRes = sobel(blurred, width, height);
+  const nms = nonMaxSuppression(sobelRes.mag, sobelRes.dir, width, height);
+  const edgeRaw = doubleThresholdHysteresis(nms, width, height, high, low);
+  const edge = guoHallThin(edgeRaw, width, height);
+
+  let edgeCount = 0;
+  for (let i = 0; i < edge.length; i++) if (edge[i] === 255) edgeCount++;
+
+  const rawPaths = traceContours(edge, width, height, 1);
+  const linkedPaths = linkPathGaps(rawPaths, 10, 30, width, height);
+  const paths = linkedPaths.filter((p) => pathArcLength(p) >= 30);
+
+  let beziers = [];
+  let bezColors = [];
+  let fourierPaths = [];
+  let capped = false;
+
+  if (mode === 'fourier') {
+    const CLOSE_THRESHOLD_FRAC = 0.02;
+    for (const p of paths) {
+      const arcLen = pathArcLength(p);
+      const closeThresholdPx = Math.max(4, arcLen * CLOSE_THRESHOLD_FRAC);
+      const closed = isPathClosed(p, closeThresholdPx);
+      const M = chooseResampleCount(arcLen);
+      const resampled = resamplePathUniform(p, M);
+      const loopPoints = closed ? resampled : mirrorClosePath(resampled);
+      const { dc: dcPixel, harmonics: harmonicsPixel } = topHarmonics(complexDFT(loopPoints), harmonicCount);
+      const tMax = closed ? 1 : M / loopPoints.length;
+      const { dc, harmonics } = flipHarmonicsY(dcPixel, harmonicsPixel, height);
+      const samples = reconstructPath(dc, harmonics, fourierSampleCount, tMax);
+      fourierPaths.push({ dc, harmonics, tMax, arcLen, samples });
+    }
+  } else {
+    outer:
+    for (let pi = 0; pi < paths.length; pi++) {
+      if (beziers.length >= maxCurves) break;
+      const simplified = rdpSimplify(paths[pi], 0.8);
+      if (simplified.length >= 2) {
+        const pathColor = fineFillEnabled ? sampleLineColor(paths[pi], data, width) : CURVE_COLOR;
+        const fitted = fitCurve(simplified, maxError);
+        for (const b of fitted) {
+          beziers.push(b);
+          bezColors.push(pathColor);
+          if (beziers.length >= maxCurves) break outer;
+        }
+      }
+    }
+    capped = beziers.length >= maxCurves && paths.length > 0;
+
+    const order = beziers.map((_, i) => i).sort((ia, ib) => {
+      const a = beziers[ia], b = beziers[ib];
+      const topA = Math.min(a[0][1], a[1][1], a[2][1], a[3][1]);
+      const topB = Math.min(b[0][1], b[1][1], b[2][1], b[3][1]);
+      return topA - topB;
+    });
+    beziers = order.map((i) => beziers[i]);
+    bezColors = order.map((i) => bezColors[i]);
+  }
+
+  const mathBeziers = beziers.map((bez) => [
+    [bez[0][0], height - bez[0][1]],
+    [bez[1][0], height - bez[1][1]],
+    [bez[2][0], height - bez[2][1]],
+    [bez[3][0], height - bez[3][1]],
+  ]);
+
+  let pixelFillPolygons = [];
+  let fillStats = null;
+  if (fillEnabled) {
+    const fillOpts = fineFillEnabled
+      ? { fine: true, numColors: 32, minAreaPx: 14, whiteThreshold: 256, blackThreshold: 8, rdpEpsilon: 1.0, maxPolygons: 2000, fixedPalette: sharedPalette, usePaletteColors: Boolean(sharedPalette) }
+      : { fixedPalette: sharedPalette };
+    const fillResult = extractFillPolygons(data, width, height, fillOpts);
+    pixelFillPolygons = fillResult.polygons;
+    fillStats = fillResult.stats;
+    pixelFillPolygons.sort((a, b) => {
+      const topA = Math.min(...a.points.map((p) => p[1]));
+      const topB = Math.min(...b.points.map((p) => p[1]));
+      return topA - topB;
+    });
+  }
+  const fillPolygons = pixelFillPolygons.map((poly) => ({
+    color: poly.color,
+    points: poly.points.map(([x, y]) => [x, height - y]),
+  }));
+
+  return {
+    width,
+    height,
+    edgeCount,
+    pathCount: paths.length,
+    paths,
+    beziers,
+    mathBeziers,
+    bezColors: fineFillEnabled ? bezColors : [],
+    fourierPaths,
+    capped,
+    pixelFillPolygons,
+    fillPolygons,
+    fillStats,
+    fillOpacity: fineFillEnabled ? '1' : '0.9',
+  };
+}
+
 // Fourier-mode latex: compact list + total() parametric form,
 //   x(t) = a0 + total(R * cos(N*2*pi*t + P))
 //   y(t) = b0 + total(R * sin(N*2*pi*t + P))
@@ -1650,6 +1887,10 @@ const maxCurvesVal = document.getElementById('maxCurvesVal');
 const speedVal = document.getElementById('speedVal');
 const renderBtn = document.getElementById('renderBtn');
 const drawBtn = document.getElementById('drawBtn');
+const videoControls = document.getElementById('videoControls');
+const videoPlayBtn = document.getElementById('videoPlayBtn');
+const frameSlider = document.getElementById('frameSlider');
+const frameVal = document.getElementById('frameVal');
 const statsEl = document.getElementById('stats');
 const calculatorEl = document.getElementById('calculator');
 const dropOverlay = document.getElementById('dropOverlay');
@@ -1674,6 +1915,7 @@ let currentImageData = null;
 let calculator = null;
 let fillEnabled = true;
 let fourierMode = false;
+let activeMediaKind = null;
 
 fillToggleBtn.addEventListener('click', () => {
   fillEnabled = !fillEnabled;
@@ -1692,6 +1934,12 @@ fineFillBtn.addEventListener('click', () => {
 // brief: "切模式后需重新渲染才生效". Swaps which of 容差(仅贝塞尔)/谐波数(仅傅里叶)
 // is visible; both sliders' underlying values are preserved across toggles.
 fourierToggleBtn.addEventListener('click', () => {
+  // v1 boundary: Fourier coefficients are not precomputed for video frames.
+  // Keep the existing toggle state untouched and explain the no-op in stats.
+  if (activeMediaKind === 'video') {
+    statsEl.innerHTML = videoStatsHtml('[!] 视频暂不支持傅里叶模式');
+    return;
+  }
   fourierMode = !fourierMode;
   fourierToggleBtn.setAttribute('aria-pressed', String(fourierMode));
   toleranceLabel.hidden = fourierMode;
@@ -1751,6 +1999,21 @@ let speedMultiplier = 1; // live-adjustable via the 绘制速度 slider; scales 
 let currentFourierPaths = [];
 const FOURIER_SAMPLE_COUNT = 240; // ink-trace resolution per path, independent of harmonic count
 
+// Video state stores vectors only after preprocessing. Decoded ImageData is
+// released once the shared palette and all vector frames have been produced.
+let mediaGeneration = 0;
+let videoFrames = [];
+let videoFrameIndex = 0;
+let videoFps = 12;
+let videoPlaying = false;
+let videoRafId = null;
+let videoStatsBase = '';
+let videoTruncated = false;
+let videoViewportInitialized = false;
+let videoDesmosHidden = true;
+let activeMediaUrl = null;
+let activeImageDecoder = null;
+
 const drawOverlay = document.getElementById('drawOverlay');
 const overlayCtx = drawOverlay.getContext('2d');
 
@@ -1799,6 +2062,180 @@ function cancelDrawAnimation() {
   }
   drawOverlay.style.display = 'none';
   if (drawOverlay.width && drawOverlay.height) overlayCtx.clearRect(0, 0, drawOverlay.width, drawOverlay.height);
+}
+
+function videoStatsHtml(extra) {
+  const total = Math.max(1, videoFrames.length);
+  let html = videoStatsBase || '[+] 视频';
+  html += STATS_SEP + '[>] 帧 ' + (videoFrameIndex + 1) + '/' + total;
+  if (videoTruncated) html += STATS_SEP + '<span class="cap">[!] 已截断至 ' + total + ' 帧</span>';
+  if (extra) html += STATS_SEP + '<span class="cap">' + extra + '</span>';
+  return html;
+}
+
+function updateVideoUi(extra) {
+  frameSlider.value = String(videoFrameIndex);
+  frameVal.textContent = (videoFrameIndex + 1) + '/' + Math.max(1, videoFrames.length);
+  statsEl.innerHTML = videoStatsHtml(extra);
+}
+
+function frameExpressions(frame, hidden) {
+  const fills = frame.fillPolygons.map((poly, i) => ({
+    id: 'fill-' + i,
+    type: 'expression',
+    color: poly.color,
+    fillOpacity: frame.fillOpacity,
+    lineOpacity: frame.fillOpacity === '1' ? '1' : '0',
+    lineWidth: '2.5',
+    hidden,
+    latex: '\\operatorname{polygon}\\left(' + poly.points.map((p) => '\\left(' + fmtNum(p[0]) + ',' + fmtNum(p[1]) + '\\right)').join(',') + '\\right)',
+  }));
+  const curves = frame.beziers.map((bez, i) => ({
+    id: 'bez-' + i,
+    type: 'expression',
+    color: frame.bezColors[i] || CURVE_COLOR,
+    lineWidth: frame.bezColors.length ? '1.75' : undefined,
+    hidden,
+    latex: segmentLatex(bez[0], bez[1], bez[2], bez[3]),
+  }));
+  return fills.concat(curves);
+}
+
+function videoViewport(frame) {
+  const marginX = frame.width * 0.08, marginY = frame.height * 0.08;
+  return { left: -marginX, right: frame.width + marginX, bottom: -marginY, top: frame.height + marginY };
+}
+
+function setVideoFrameInDesmos(frame, hidden, initializeViewport) {
+  if (!calculator) return 0;
+  const started = performance.now();
+  const state = calculator.getState();
+  state.expressions.list = frameExpressions(frame, hidden);
+  if (initializeViewport) {
+    state.graph = state.graph || {};
+    state.graph.viewport = aspectCorrectViewport(videoViewport(frame));
+  }
+  calculator.setState(state);
+  if (initializeViewport) calculator.setMathBounds(state.graph.viewport);
+  videoDesmosHidden = hidden;
+  return performance.now() - started;
+}
+
+function drawVideoFrame(frame) {
+  if (!calculator || !frame) return;
+  resizeOverlayToCalculator();
+  drawOverlay.style.display = 'block';
+  const bounds = calculator.graphpaperBounds;
+  overlayCtx.clearRect(0, 0, drawOverlay.width, drawOverlay.height);
+  overlayCtx.lineCap = 'round';
+  overlayCtx.lineJoin = 'round';
+
+  overlayCtx.globalAlpha = parseFloat(frame.fillOpacity);
+  for (const poly of frame.fillPolygons) {
+    if (poly.points.length < 3) continue;
+    const first = mathToPixel(poly.points[0][0], poly.points[0][1], bounds);
+    overlayCtx.fillStyle = poly.color;
+    overlayCtx.beginPath();
+    overlayCtx.moveTo(first[0], first[1]);
+    for (let i = 1; i < poly.points.length; i++) {
+      const p = mathToPixel(poly.points[i][0], poly.points[i][1], bounds);
+      overlayCtx.lineTo(p[0], p[1]);
+    }
+    overlayCtx.closePath();
+    overlayCtx.fill();
+  }
+  overlayCtx.globalAlpha = 1;
+
+  overlayCtx.lineWidth = frame.bezColors.length ? 1.75 : 2.5;
+  for (let i = 0; i < frame.beziers.length; i++) {
+    const bez = frame.beziers[i];
+    const p0 = mathToPixel(bez[0][0], bez[0][1], bounds);
+    const p1 = mathToPixel(bez[1][0], bez[1][1], bounds);
+    const p2 = mathToPixel(bez[2][0], bez[2][1], bounds);
+    const p3 = mathToPixel(bez[3][0], bez[3][1], bounds);
+    overlayCtx.strokeStyle = frame.bezColors[i] || CURVE_COLOR;
+    overlayCtx.beginPath();
+    overlayCtx.moveTo(p0[0], p0[1]);
+    overlayCtx.bezierCurveTo(p1[0], p1[1], p2[0], p2[1], p3[0], p3[1]);
+    overlayCtx.stroke();
+  }
+}
+
+function stopVideoRaf() {
+  if (videoRafId !== null) cancelAnimationFrame(videoRafId);
+  videoRafId = null;
+  videoPlaying = false;
+}
+
+function pauseVideoPlayback(commitFrame) {
+  if (videoFrames.length === 0) return;
+  stopVideoRaf();
+  videoPlayBtn.textContent = '[>] 播放';
+  const frame = videoFrames[videoFrameIndex];
+  drawVideoFrame(frame);
+  const myGen = mediaGeneration;
+  const commitMs = commitFrame ? setVideoFrameInDesmos(frame, false) : 0;
+  updateVideoUi();
+  if (commitFrame) {
+    const graceMs = Math.max(100, commitMs * 2);
+    setTimeout(() => requestAnimationFrame(() => {
+      if (myGen !== mediaGeneration || videoPlaying) return;
+      drawOverlay.style.display = 'none';
+      overlayCtx.clearRect(0, 0, drawOverlay.width, drawOverlay.height);
+    }), graceMs);
+  }
+}
+
+function startVideoPlayback() {
+  if (!calculator || videoFrames.length === 0 || videoPlaying) return;
+  cancelDrawAnimation();
+  const myGen = mediaGeneration;
+  videoPlaying = true;
+  videoPlayBtn.textContent = '[||] 暂停';
+  drawVideoFrame(videoFrames[videoFrameIndex]);
+  setVideoFrameInDesmos(videoFrames[videoFrameIndex], true, !videoViewportInitialized);
+  videoViewportInitialized = true;
+  let lastTime = performance.now();
+  let accumulator = 0;
+
+  function step() {
+    if (myGen !== mediaGeneration || !videoPlaying) return;
+    const now = performance.now();
+    const advanced = advanceVideoPlayback(
+      videoFrameIndex, accumulator, now - lastTime, speedMultiplier, videoFps, videoFrames.length,
+    );
+    lastTime = now;
+    videoFrameIndex = advanced.index;
+    accumulator = advanced.accumulatorMs;
+    drawVideoFrame(videoFrames[videoFrameIndex]);
+    updateVideoUi();
+    videoRafId = requestAnimationFrame(step);
+  }
+  videoRafId = requestAnimationFrame(step);
+}
+
+function cancelMediaWork() {
+  mediaGeneration++;
+  stopVideoRaf();
+  cancelDrawAnimation();
+  if (activeImageDecoder) {
+    try { activeImageDecoder.close(); } catch (e) { /* already closed */ }
+    activeImageDecoder = null;
+  }
+  if (activeMediaUrl) {
+    URL.revokeObjectURL(activeMediaUrl);
+    activeMediaUrl = null;
+  }
+  videoFrames = [];
+  videoFrameIndex = 0;
+  videoTruncated = false;
+  videoViewportInitialized = false;
+  videoDesmosHidden = true;
+  videoStatsBase = '';
+  activeMediaKind = null;
+  videoControls.hidden = true;
+  videoPlayBtn.disabled = true;
+  frameSlider.max = '0';
 }
 
 function startDrawAnimation() {
@@ -2194,6 +2631,22 @@ speedSlider.addEventListener('input', () => {
   speedVal.textContent = speedMultiplier.toFixed(1);
 });
 
+videoPlayBtn.addEventListener('click', () => {
+  if (videoPlaying) pauseVideoPlayback(true); else startVideoPlayback();
+});
+
+frameSlider.addEventListener('input', () => {
+  if (videoFrames.length === 0) return;
+  videoFrameIndex = clamp(Number(frameSlider.value) | 0, 0, videoFrames.length - 1);
+  stopVideoRaf();
+  videoPlayBtn.textContent = '[>] 播放';
+  if (!videoDesmosHidden) setVideoFrameInDesmos(videoFrames[videoFrameIndex], true, false);
+  drawVideoFrame(videoFrames[videoFrameIndex]);
+  updateVideoUi();
+});
+
+frameSlider.addEventListener('change', () => pauseVideoPlayback(true));
+
 fileInput.addEventListener('change', () => {
   if (fileInput.files && fileInput.files[0]) handleFile(fileInput.files[0]);
 });
@@ -2234,11 +2687,240 @@ function loadImageFile(file) {
   });
 }
 
-async function handleFile(file) {
+function cancelledGeneration(generation) {
+  if (generation !== mediaGeneration) {
+    const error = new Error('cancelled');
+    error.cancelled = true;
+    throw error;
+  }
+}
+
+function scaledVideoSize(width, height) {
+  const scale = Math.min(1, 600 / Math.max(width, height));
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
+  };
+}
+
+async function seekVideo(video, time, generation) {
+  cancelledGeneration(generation);
+  const target = Math.max(0, Math.min(time, Math.max(0, video.duration - 0.001)));
+  if (video.readyState >= 2 && Math.abs(video.currentTime - target) < 0.0005) return;
+  await new Promise((resolve, reject) => {
+    const cleanup = () => {
+      video.removeEventListener('seeked', onSeeked);
+      video.removeEventListener('error', onError);
+    };
+    const onSeeked = () => { cleanup(); resolve(); };
+    const onError = () => { cleanup(); reject(new Error('视频帧解码失败')); };
+    video.addEventListener('seeked', onSeeked, { once: true });
+    video.addEventListener('error', onError, { once: true });
+    video.currentTime = target;
+  });
+  cancelledGeneration(generation);
+}
+
+async function decodeHtmlVideoFrames(file, generation) {
+  const video = document.createElement('video');
+  video.muted = true;
+  video.preload = 'auto';
+  video.playsInline = true;
+  activeMediaUrl = URL.createObjectURL(file);
+  video.src = activeMediaUrl;
+  await new Promise((resolve, reject) => {
+    video.addEventListener('loadedmetadata', resolve, { once: true });
+    video.addEventListener('error', () => reject(new Error('无法解码视频，请确认文件为 MP4 或 WebM')), { once: true });
+    video.load();
+  });
+  cancelledGeneration(generation);
+  if (video.readyState < 2) {
+    await new Promise((resolve, reject) => {
+      video.addEventListener('loadeddata', resolve, { once: true });
+      video.addEventListener('error', () => reject(new Error('无法读取视频首帧')), { once: true });
+    });
+    cancelledGeneration(generation);
+  }
+  if (!Number.isFinite(video.duration) || video.duration <= 0 || !video.videoWidth || !video.videoHeight) {
+    throw new Error('视频没有可用画面或时长');
+  }
+  const size = scaledVideoSize(video.videoWidth, video.videoHeight);
+  const canvas = document.createElement('canvas');
+  canvas.width = size.width; canvas.height = size.height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const plan = planVideoSamples(video.duration, 12, 120);
+  const decoded = [];
+  for (let i = 0; i < plan.times.length; i++) {
+    await seekVideo(video, plan.times[i], generation);
+    ctx.drawImage(video, 0, 0, size.width, size.height);
+    decoded.push(ctx.getImageData(0, 0, size.width, size.height));
+    statsEl.textContent = '[+] 解码视频… ' + (i + 1) + '/' + plan.times.length;
+    await yieldToUI();
+    cancelledGeneration(generation);
+  }
+  URL.revokeObjectURL(activeMediaUrl);
+  activeMediaUrl = null;
+  video.removeAttribute('src');
+  video.load();
+  return { decoded, fps: plan.fps, truncated: plan.truncated, width: size.width, height: size.height };
+}
+
+async function decodeGifFrames(file, generation) {
+  if (typeof ImageDecoder === 'undefined') {
+    throw new Error('当前浏览器不支持 GIF 动画解码（需要 Chromium ImageDecoder），请将 GIF 转为 MP4 后重试');
+  }
+  const data = await file.arrayBuffer();
+  cancelledGeneration(generation);
+  let decoder = new ImageDecoder({ data, type: 'image/gif' });
+  activeImageDecoder = decoder;
+  await decoder.tracks.ready;
+  cancelledGeneration(generation);
+  const track = decoder.tracks.selectedTrack;
+  if (!track || !track.frameCount) throw new Error('GIF 没有可用动画帧');
+
+  const durationsUs = [];
+  let size = null;
+  let scanTruncated = false;
+  for (let sourceIndex = 0; sourceIndex < track.frameCount; sourceIndex++) {
+    const result = await decoder.decode({ frameIndex: sourceIndex, completeFramesOnly: true });
+    cancelledGeneration(generation);
+    const image = result.image;
+    if (!size) {
+      size = scaledVideoSize(image.displayWidth, image.displayHeight);
+    }
+    const durationUs = Number.isFinite(image.duration) && image.duration > 0 ? image.duration : 100000;
+    durationsUs.push(durationUs);
+    image.close();
+    statsEl.textContent = '[+] 分析 GIF… ' + (sourceIndex + 1) + '/' + track.frameCount;
+    if (planGifSamples(durationsUs, 12, 120).indices.length >= 120) {
+      scanTruncated = sourceIndex < track.frameCount - 1;
+      break;
+    }
+    if (sourceIndex % 4 === 0) {
+      await yieldToUI();
+      cancelledGeneration(generation);
+    }
+  }
+  decoder.close();
+  cancelledGeneration(generation);
+
+  const plan = planGifSamples(durationsUs, 12, 120);
+  if (!plan.indices.length || !size) throw new Error('GIF 没有可用动画帧');
+  decoder = new ImageDecoder({ data, type: 'image/gif' });
+  activeImageDecoder = decoder;
+  await decoder.tracks.ready;
+  cancelledGeneration(generation);
+
+  const canvas = document.createElement('canvas');
+  canvas.width = size.width; canvas.height = size.height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const decoded = [];
+  for (let i = 0; i < plan.indices.length; i++) {
+    const result = await decoder.decode({ frameIndex: plan.indices[i], completeFramesOnly: true });
+    cancelledGeneration(generation);
+    const image = result.image;
+    ctx.clearRect(0, 0, size.width, size.height);
+    ctx.drawImage(image, 0, 0, size.width, size.height);
+    decoded.push(ctx.getImageData(0, 0, size.width, size.height));
+    image.close();
+    statsEl.textContent = '[+] 解码 GIF… ' + (i + 1) + '/' + plan.indices.length;
+    if (i % 4 === 0) {
+      await yieldToUI();
+      cancelledGeneration(generation);
+    }
+  }
+  decoder.close();
+  activeImageDecoder = null;
+  return {
+    decoded,
+    fps: 12,
+    truncated: scanTruncated || plan.truncated,
+    width: size.width,
+    height: size.height,
+  };
+}
+
+async function preprocessVideoFrames(decodedMedia, generation) {
+  const { decoded, width, height } = decodedMedia;
+  const paletteSources = [];
+  const paletteFrameCount = Math.min(12, decoded.length);
+  for (let i = 0; i < paletteFrameCount; i++) {
+    const index = Math.min(decoded.length - 1, Math.floor(i * decoded.length / paletteFrameCount));
+    paletteSources.push(decoded[index].data);
+  }
+  const sharedPalette = fillEnabled
+    ? buildSharedPalette(paletteSources, fineFillEnabled ? 32 : 14, fineFillEnabled)
+    : null;
+  const frames = [];
+  let firstPixelBeziers = null;
+  for (let i = 0; i < decoded.length; i++) {
+    cancelledGeneration(generation);
+    statsEl.textContent = '[+] 矢量化视频… ' + (i + 1) + '/' + decoded.length;
+    const result = vectorizeFrame(decoded[i], {
+      high: Number(thresholdSlider.value),
+      maxError: Number(toleranceSlider.value),
+      maxCurves: Number(maxCurvesSlider.value),
+      mode: 'bezier',
+      fillEnabled,
+      fineFillEnabled,
+      sharedPalette,
+    });
+    if (i === 0) firstPixelBeziers = result.beziers;
+    frames.push({
+      width,
+      height,
+      beziers: result.mathBeziers,
+      bezColors: result.bezColors,
+      fillPolygons: result.fillPolygons,
+      fillOpacity: result.fillOpacity,
+      edgeCount: result.edgeCount,
+      pathCount: result.pathCount,
+    });
+    await yieldToUI();
+  }
+  cancelledGeneration(generation);
+
+  sourceCanvas.width = width; sourceCanvas.height = height;
+  sourceCanvas.getContext('2d').putImageData(decoded[0], 0, 0);
+  sourceSection.hidden = false;
+  previewWrap.hidden = false;
+  if (firstPixelBeziers) drawPreview(firstPixelBeziers, width, height);
+  return frames;
+}
+
+async function handleVideoFile(file, generation, isGif) {
+  statsEl.classList.remove('err');
+  statsEl.textContent = isGif ? '[+] 加载 GIF…' : '[+] 加载视频…';
+  activeMediaKind = 'video';
+  renderBtn.disabled = true;
+  drawBtn.disabled = true;
+  const decodedMedia = isGif
+    ? await decodeGifFrames(file, generation)
+    : await decodeHtmlVideoFrames(file, generation);
+  cancelledGeneration(generation);
+  const frames = await preprocessVideoFrames(decodedMedia, generation);
+  cancelledGeneration(generation);
+
+  videoFrames = frames;
+  videoFrameIndex = 0;
+  videoFps = Math.min(12, decodedMedia.fps || 12);
+  videoTruncated = decodedMedia.truncated;
+  videoStatsBase = '[+] ' + frames.length + ' 帧预处理' + STATS_SEP + '[+] ' + videoFps.toFixed(1) + 'fps';
+  frameSlider.min = '0';
+  frameSlider.max = String(Math.max(0, frames.length - 1));
+  frameSlider.value = '0';
+  videoControls.hidden = false;
+  videoPlayBtn.disabled = frames.length === 0;
+  updateVideoUi(fourierMode ? '[!] 视频暂不支持傅里叶模式' : '');
+  if (calculator && frames.length) startVideoPlayback();
+}
+
+async function handleImageFile(file, generation) {
   statsEl.classList.remove('err');
   statsEl.textContent = '[+] 加载图片中…';
   try {
     const img = await loadImageFile(file);
+    cancelledGeneration(generation);
     let w = img.naturalWidth, h = img.naturalHeight;
     if (w === 0 || h === 0) throw new Error('Image has no pixels');
     const maxDim = Math.max(w, h);
@@ -2276,11 +2958,34 @@ async function handleFile(file) {
     sourceSection.hidden = false;
     previewWrap.hidden = false;
     renderBtn.disabled = false;
-    await render();
+    activeMediaKind = 'image';
+    await render(generation);
   } catch (err) {
+    if (err.cancelled || generation !== mediaGeneration) return;
     console.error(err);
     statsEl.classList.add('err');
     statsEl.textContent = '[x] 加载图片出错: ' + err.message;
+  }
+}
+
+async function handleFile(file) {
+  cancelMediaWork();
+  isRendering = false;
+  const generation = mediaGeneration;
+  const type = (file.type || '').toLowerCase();
+  const name = (file.name || '').toLowerCase();
+  const isGif = type === 'image/gif' || name.endsWith('.gif');
+  const isVideo = type === 'video/mp4' || type === 'video/webm' || name.endsWith('.mp4') || name.endsWith('.webm');
+  try {
+    if (isGif) await handleVideoFile(file, generation, true);
+    else if (isVideo) await handleVideoFile(file, generation, false);
+    else if (type.startsWith('image/')) await handleImageFile(file, generation);
+    else throw new Error('仅支持静态图片、GIF、MP4 或 WebM 文件');
+  } catch (err) {
+    if (err.cancelled || generation !== mediaGeneration) return;
+    console.error(err);
+    statsEl.classList.add('err');
+    statsEl.textContent = '[x] 加载媒体出错: ' + err.message;
   }
 }
 
@@ -2352,7 +3057,7 @@ function aspectCorrectViewport(viewport) {
   }
 }
 
-function renderToDesmos(expressions, viewport) {
+function renderToDesmos(expressions, viewport, generation) {
   const vp = aspectCorrectViewport(viewport);
   const state = calculator.getState();
   state.expressions.list = expressions;
@@ -2364,11 +3069,15 @@ function renderToDesmos(expressions, viewport) {
   // pin it explicitly, and once more after the layout pass (re-correct with
   // the settled graph paper aspect, which may differ pre-layout).
   calculator.setMathBounds(vp);
-  setTimeout(() => calculator.setMathBounds(aspectCorrectViewport(viewport)), 400);
+  setTimeout(() => {
+    if (generation !== undefined && generation !== mediaGeneration) return;
+    calculator.setMathBounds(aspectCorrectViewport(viewport));
+  }, 400);
 }
 
-async function render() {
-  if (!currentImageData || isRendering) return;
+async function render(generation) {
+  const expectedGeneration = generation === undefined ? mediaGeneration : generation;
+  if (!currentImageData || isRendering || activeMediaKind === 'video') return;
   isRendering = true;
   renderBtn.disabled = true;
   drawBtn.disabled = true;
@@ -2377,123 +3086,45 @@ async function render() {
   statsEl.classList.remove('err');
   statsEl.textContent = '[+] 处理中…';
   try {
-    const { width, height, data } = currentImageData;
+    const { width, height } = currentImageData;
     const high = Number(thresholdSlider.value);
-    const low = high * 0.4;
     const maxError = Number(toleranceSlider.value);
     const maxCurves = Number(maxCurvesSlider.value);
     const harmonicCount = Number(harmonicsSlider.value);
 
+    // vectorizeFrame is the shared, DOM-free image/video pipeline. The yields
+    // surrounding it keep the existing render handoff asynchronous while the
+    // pure function itself remains directly unit-testable in Node.
     await yieldToUI();
-    const gray = toGrayscale(data, width, height);
+    cancelledGeneration(expectedGeneration);
+    const frame = vectorizeFrame(currentImageData, {
+      high,
+      maxError,
+      maxCurves,
+      mode: fourierMode ? 'fourier' : 'bezier',
+      harmonicCount,
+      fillEnabled,
+      fineFillEnabled,
+      fourierSampleCount: FOURIER_SAMPLE_COUNT,
+    });
     await yieldToUI();
-    const blurred = gaussianBlur5(gray, width, height);
-    await yieldToUI();
-    const sobelRes = sobel(blurred, width, height);
-    await yieldToUI();
-    const nms = nonMaxSuppression(sobelRes.mag, sobelRes.dir, width, height);
-    await yieldToUI();
-    const edgeRaw = doubleThresholdHysteresis(nms, width, height, high, low);
-    await yieldToUI();
-    const edge = guoHallThin(edgeRaw, width, height);
-    await yieldToUI();
+    cancelledGeneration(expectedGeneration);
 
-    let edgeCount = 0;
-    for (let i = 0; i < edge.length; i++) if (edge[i] === 255) edgeCount++;
-
-    // Trace with a low internal threshold so short-but-real fragments survive
-    // to be gap-linked, then apply the real minimum length after linking —
-    // otherwise minLength=8 would discard exactly the tiny pieces gap-linking
-    // needs to reassemble into a full contour. Tracing, linking, and the
-    // length filter together cost single-digit milliseconds even on a dense
-    // 1000px image (profiled), so they share one yield rather than each
-    // paying rAF's per-call latency for negligible chunking benefit.
-    const rawPaths = traceContours(edge, width, height, 1);
-    // gap/angle/minLength retuned after switching to sub-pixel NMS: the old
-    // values (20, 35, 8) were tuned against quantized-NMS fragmentation and
-    // over-linked/over-kept short pieces once the edge map itself became far
-    // less fragmented (demo-dragon-v2: 4838 connected components -> 131).
-    const linkedPaths = linkPathGaps(rawPaths, 10, 30, width, height);
-    function pathArcLength(p) {
-      let l = 0;
-      for (let i = 1; i < p.length; i++) l += Math.hypot(p[i][0] - p[i - 1][0], p[i][1] - p[i - 1][1]);
-      return l;
-    }
-    const paths = linkedPaths.filter((p) => pathArcLength(p) >= 30);
-    await yieldToUI();
-
-    // Branch point (brief: "傅里叶分叉在轮廓追踪+桥接后的像素级路径"): `paths` above
-    // is shared by both modes unchanged. Bezier does RDP simplify + Schneider
-    // fitCurve on it (unchanged from before this feature existed); Fourier
-    // resamples the DENSE pre-RDP points directly (RDP's sparse vertices
-    // would starve uniform arc-length resampling of real detail). Declared
-    // here so both branches can populate them and the shared tail below
-    // (fill pipeline, preview, Desmos push, stats, animation trigger) can
-    // read whichever one applies.
-    let allBeziers = [];
-    let capped = false;
+    const edgeCount = frame.edgeCount;
+    const paths = frame.paths;
+    const allBeziers = frame.beziers;
+    const capped = frame.capped;
     let expressions = [];
     let fourierHarmonicTotal = 0;
 
     if (!fourierMode) {
-      let lastYield = performance.now();
-      let bezColors = []; // parallel to allBeziers; per-path sampled ink in fine mode
-      outer:
-      for (let pi = 0; pi < paths.length; pi++) {
-        if (allBeziers.length >= maxCurves) break;
-        const simplified = rdpSimplify(paths[pi], 0.8);
-        if (simplified.length >= 2) {
-          const pathColor = fineFillEnabled ? sampleLineColor(paths[pi], data, width) : CURVE_COLOR;
-          const beziers = fitCurve(simplified, maxError);
-          for (const b of beziers) {
-            allBeziers.push(b);
-            bezColors.push(pathColor);
-            if (allBeziers.length >= maxCurves) break outer;
-          }
-        }
-        if (performance.now() - lastYield > 40) {
-          await yieldToUI();
-          lastYield = performance.now();
-        }
-      }
-      capped = allBeziers.length >= maxCurves && paths.length > 0;
-
-      // Draw-in animation flows top to bottom: order curves by their topmost
-      // control point (Bezier's convex-hull property means the curve itself
-      // never rises above the min-y of its own control points, so this is a
-      // safe, cheap ordering key without sampling the curve). Order only
-      // affects animation sequencing, not the static final picture.
-      const order = allBeziers.map((_, i) => i).sort((ia, ib) => {
-        const a = allBeziers[ia], b = allBeziers[ib];
-        const topA = Math.min(a[0][1], a[1][1], a[2][1], a[3][1]);
-        const topB = Math.min(b[0][1], b[1][1], b[2][1], b[3][1]);
-        return topA - topB;
-      });
-      allBeziers = order.map((i) => allBeziers[i]);
-      bezColors = order.map((i) => bezColors[i]);
-      // Only fine mode publishes per-curve colors; standard mode leaves this
-      // empty so every consumer (overlay stroke, final commit, lineWidth
-      // gates) falls back to the original CURVE_COLOR/2.5 behavior.
-      currentCurveColors = fineFillEnabled ? bezColors : [];
-
-      // Flip y (image coords -> math coords) so the drawing is upright in
-      // Desmos. Every curve starts hidden -- the real drawing happens on the
-      // canvas overlay (startDrawAnimation), which sweeps currentMathBeziers
-      // top-to-bottom (matching the sort above) and only touches Desmos once
-      // more, at the very end, to bulk-unhide everything.
-      const n = allBeziers.length;
-      const mathBeziers = allBeziers.map((bez) => [
-        [bez[0][0], height - bez[0][1]],
-        [bez[1][0], height - bez[1][1]],
-        [bez[2][0], height - bez[2][1]],
-        [bez[3][0], height - bez[3][1]],
-      ]);
-      currentMathBeziers = mathBeziers;
+      currentCurveColors = frame.bezColors;
+      currentMathBeziers = frame.mathBeziers;
       currentFourierPaths = []; // stale Fourier state from a previous mode must not leak into this render
-      expressions = mathBeziers.map((bez, i) => ({
+      expressions = currentMathBeziers.map((bez, i) => ({
         id: 'bez-' + i,
         type: 'expression',
-        color: bezColors[i] || CURVE_COLOR,
+        color: currentCurveColors[i] || CURVE_COLOR,
         lineWidth: fineFillEnabled ? '1.75' : undefined, // fine: thinner ink so small features (eyes) aren't swallowed; undefined -> Desmos default (standard mode unchanged)
         hidden: true,
         latex: segmentLatex(bez[0], bez[1], bez[2], bez[3]),
@@ -2502,37 +3133,9 @@ async function render() {
       currentMathBeziers = [];
       currentCurveCount = 0; // stale Bezier state from a previous mode must not leak into this render
       currentCurveColors = [];
-      // Path-level cap: minLength(30px) already keeps path counts small on
-      // every test image (max observed ~86 on demo-dragon-v2), nowhere near
-      // where a maxCurves-style cap would matter -- "曲线上限" stays a
-      // Bezier-only control (brief only calls out hiding 容差, not repurposing
-      // this slider), left visible but inert in Fourier mode.
-      const CLOSE_THRESHOLD_FRAC = 0.02; // endpoints within 2% of the path's own arc length (min 4px) count as already closed
-      const fourierPaths = [];
-      for (const p of paths) {
-        const arcLen = pathArcLength(p);
-        const closeThresholdPx = Math.max(4, arcLen * CLOSE_THRESHOLD_FRAC);
-        const closed = isPathClosed(p, closeThresholdPx);
-        const M = chooseResampleCount(arcLen);
-        const resampled = resamplePathUniform(p, M);
-        const loopPoints = closed ? resampled : mirrorClosePath(resampled);
-        const { dc: dcPixel, harmonics: harmonicsPixel } = topHarmonics(complexDFT(loopPoints), harmonicCount);
-        // Animation-only cutoff: for a mirrored open path, t in [0, tMax]
-        // traces the forward pass once; t in [tMax, 1] retraces it backward
-        // over already-drawn ink (brief: avoid drawing it twice). A closed
-        // path has no mirrored half, so its whole loop is "new" (tMax=1).
-        const tMax = closed ? 1 : M / loopPoints.length;
-        // Flip to math space (y-up) once here -- see flipHarmonicsY's
-        // derivation comment -- so the Desmos latex, the overlay animation,
-        // and the preview canvas all share one MATH-space source of truth,
-        // matching how the Bezier branch flips once into currentMathBeziers.
-        const { dc, harmonics } = flipHarmonicsY(dcPixel, harmonicsPixel, height);
-        const samples = reconstructPath(dc, harmonics, FOURIER_SAMPLE_COUNT, tMax);
-        fourierPaths.push({ dc, harmonics, tMax, arcLen, samples });
-      }
-      currentFourierPaths = fourierPaths;
-      fourierHarmonicTotal = fourierPaths.reduce((sum, fp) => sum + fp.harmonics.length, 0);
-      expressions = fourierPaths.map((fp, i) => ({
+      currentFourierPaths = frame.fourierPaths;
+      fourierHarmonicTotal = currentFourierPaths.reduce((sum, fp) => sum + fp.harmonics.length, 0);
+      expressions = currentFourierPaths.map((fp, i) => ({
         id: 'four-' + i,
         type: 'expression',
         color: CURVE_COLOR,
@@ -2541,41 +3144,10 @@ async function render() {
       }));
     }
 
-    // Color fill (填色): independent of the edge/curve pipeline above, runs
-    // directly on the raw image data. Gated by the toolbar toggle -- when
-    // off, fillPolygons stays empty and every downstream step (expressions,
-    // stats line, final commit) is identical to the no-fill code path.
-    let fillPolygons = [];
-    let fillStats = null;
-    currentFillOpacity = fineFillEnabled ? '1' : '0.9';
-    if (fillEnabled) {
-      // Fine params: 32 colors resolves anime shading gradients into cel-like
-      // bands (14 crushes them); minArea 14 keeps eyes/small ornaments at
-      // portrait scale; whiteThreshold 256 disables whiteness exclusion
-      // entirely (background removal is the flood mask's job in fine mode);
-      // opacity 1 because posterized portraits need solid coverage -- 0.9
-      // leaks the grid through every fill.
-      const fillOpts = fineFillEnabled
-        ? { fine: true, numColors: 32, minAreaPx: 14, whiteThreshold: 256, blackThreshold: 8, rdpEpsilon: 1.0, maxPolygons: 2000 }
-        : {};
-      const fillResult = extractFillPolygons(data, width, height, fillOpts);
-      fillPolygons = fillResult.polygons;
-      fillStats = fillResult.stats;
-      // Same top-to-bottom convention as the curve sort above (by topmost
-      // point, pre-flip, in image coords) so the fill-in phase flows the
-      // same visual direction as the line sweep instead of switching to a
-      // different scan order.
-      fillPolygons.sort((a, b) => {
-        const topA = Math.min(...a.points.map((p) => p[1]));
-        const topB = Math.min(...b.points.map((p) => p[1]));
-        return topA - topB;
-      });
-    }
-    // Same y-flip as curves; fills share the identical math coordinate space.
-    currentFillPolygons = fillPolygons.map((poly) => ({
-      color: poly.color,
-      points: poly.points.map(([x, y]) => [x, height - y]),
-    }));
+    const fillPolygons = frame.pixelFillPolygons;
+    const fillStats = frame.fillStats;
+    currentFillOpacity = frame.fillOpacity;
+    currentFillPolygons = frame.fillPolygons;
     // Fill expressions are placed BEFORE the curve expressions in the list --
     // confirmed live that Desmos draws later list entries on top, so this
     // ordering is what keeps fills under the line work, not a cosmetic choice.
@@ -2603,7 +3175,7 @@ async function render() {
     }
 
     if (calculator) {
-      renderToDesmos(fillExpressions.concat(expressions), viewport);
+      renderToDesmos(fillExpressions.concat(expressions), viewport, expectedGeneration);
     }
 
     const ms = Math.round(performance.now() - t0);
@@ -2643,12 +3215,15 @@ async function render() {
       currentCurveCount = 0;
     }
   } catch (err) {
+    if (err.cancelled) return;
     console.error(err);
     statsEl.classList.add('err');
     statsEl.textContent = '[x] 出错: ' + err.message;
   } finally {
-    isRendering = false;
-    renderBtn.disabled = false;
+    if (expectedGeneration === mediaGeneration) {
+      isRendering = false;
+      renderBtn.disabled = activeMediaKind === 'video';
+    }
   }
 }
 

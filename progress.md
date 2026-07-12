@@ -1,5 +1,11 @@
 # progress — Desmos Bézier Renderer
 
+- **第十期(2026-07-13 凌晨,已验收):GIF/MP4/WebM 视频输入**。赛后继续打造的第一个功能。架构(甲方拍板):解码 → 逐帧跑共享矢量化管线(预处理,≤12fps/≤120帧/帧maxDim 600) → 覆盖层 canvas 播放矢量动画 → **暂停即方程**(暂停时当前帧一次 setState 提交 Desmos,播放时全部 hidden)。实现 codex(新 codex-dispatch 直驱链路,job: ~/.codex-jobs/desmos-bezier/20260713-video-input,方案确认一停 + GIF bug 修复一停,全程 ~50 分钟)。要点:
+  1. `vectorizeFrame` 纯函数抽取(静态路径逐字节不变,基线当场复核);MP4/WebM 走 `<video>` seek 解码,GIF 走 WebCodecs ImageDecoder(保零依赖,不可用时中文报错建议转 MP4);视频填色用全片共享调色板防帧间跳色;傅里叶×视频为 v1 边界(禁用+提示)。
+  2. 过程 bug:GIF 采样按 `ImageDecoder.timestamp` 对 83333µs 网格在线采样,GIF 时基下丢帧(36帧素材只出24,主会话浏览器复跑抓到,codex 修为两遍解码+按帧 duration 规划采样,补 36×80ms node 断言)。
+  3. 验收:node 单测 28+12+22 全绿;浏览器套件(codex 沙箱跑不了,主会话代跑)静态基线全绿+MP4/GIF 各 9 项全流程+dpr=2+console 零错误全过;主会话暗题 Bad Apple 12s 片段(codex 不知情素材):120 帧预处理/播放剪影连续可辨/暂停帧 81 表达式 expressionAnalysis 全绿/截断提示正确。报告 report-video-input.md。
+  4. codex-dispatch 链路首战复盘:方案关口会停等确认(followup+resume 批准);沙箱起不了 http.server 和浏览器,browser 验收天然归主会话——分工恰好符合"实现者不自验"。
+
 - 单文件 `index.html`,零依赖(仅 Desmos script tag),管线:grayscale → Gaussian → Canny → 8 连通轮廓追踪 → RDP → Schneider fitCurve → De Casteljau latex → `calculator.setState`。实现:codex(bezier-impl),两轮(功能 + opencode.ai 设计蒙皮)。
 - 关键修复记录:
   1. fitCubic 分裂点切线符号反了(codex 自查,对照 Graphics Gems 原文修复)。
