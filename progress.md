@@ -6,7 +6,8 @@
   3. 验收:node 单测 28+12+22 全绿;浏览器套件(codex 沙箱跑不了,主会话代跑)静态基线全绿+MP4/GIF 各 9 项全流程+dpr=2+console 零错误全过;主会话暗题 Bad Apple 12s 片段(codex 不知情素材):120 帧预处理/播放剪影连续可辨/暂停帧 81 表达式 expressionAnalysis 全绿/截断提示正确。报告 report-video-input.md。
   4. 已同步线上(2026-07-13 01:06,md5 一致)。
   5. Bad Apple 演示视频(2026-07-13 上午,主会话):21.5s/1080p,真录屏播放段 + 原曲对轨(音乐精确停在暂停帧)+ 暂停后方程列表展开特写。桌面 badapple-desmos-demo.mp4 + 线上 /badapple-demo.mp4(200)。素材含二次创作 PV 与原曲,仅个人分享用途,未入 git 仓库。制作坑:①playwright 录像时间轴在页面重绘稀疏期(预处理)被压缩,与墙钟不一致,剪辑对位要用画面内容(帧计数器反推)不能用墙钟标记;②Desmos updateSettings({expressions:true}) 恢复的是折叠态,要配 expressionsCollapsed:false;③验收脚本 window.calculator 恒真(id 撞名 DOM 元素),等待条件必须探真实 API(typeof calculator==='object'&&calculator.setMathBounds)。
-  6. codex-dispatch 链路首战复盘:方案关口会停等确认(followup+resume 批准);沙箱起不了 http.server 和浏览器,browser 验收天然归主会话——分工恰好符合"实现者不自验"。
+  6. 补丁(2026-07-13 傍晚,主会话直改):右下角"图 1. 原图"随视频播放同步——预处理时每帧存 220px 缩略图 ImageData(~13MB/120帧,随 videoFrames GC),drawVideoFrame 统一刷新(对象恒等 guard 防 60fps rAF 重复 blit),播放/拖帧/暂停全同帧。暗题(播放中三采样哈希互异+拖帧跟随)+全量浏览器回归全绿,已推线上。
+  7. codex-dispatch 链路首战复盘:方案关口会停等确认(followup+resume 批准);沙箱起不了 http.server 和浏览器,browser 验收天然归主会话——分工恰好符合"实现者不自验"。
 
 - 单文件 `index.html`,零依赖(仅 Desmos script tag),管线:grayscale → Gaussian → Canny → 8 连通轮廓追踪 → RDP → Schneider fitCurve → De Casteljau latex → `calculator.setState`。实现:codex(bezier-impl),两轮(功能 + opencode.ai 设计蒙皮)。
 - 关键修复记录:

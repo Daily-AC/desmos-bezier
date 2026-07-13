@@ -2121,8 +2121,23 @@ function setVideoFrameInDesmos(frame, hidden, initializeViewport) {
   return performance.now() - started;
 }
 
+// 右下角"图 1. 原图"跟随当前帧:预处理时为每帧存了 220px 缩略图(ImageData),
+// 播放/拖帧/暂停都经过 drawVideoFrame,在此同步刷新;guard 防止 60fps rAF
+// 对 12fps 帧做重复 putImageData。
+let lastThumbFrame = null;
+function updateSourceThumb(frame) {
+  if (!frame || !frame.thumb || frame === lastThumbFrame) return;
+  lastThumbFrame = frame;
+  if (sourceCanvas.width !== frame.thumb.width || sourceCanvas.height !== frame.thumb.height) {
+    sourceCanvas.width = frame.thumb.width;
+    sourceCanvas.height = frame.thumb.height;
+  }
+  sourceCanvas.getContext('2d').putImageData(frame.thumb, 0, 0);
+}
+
 function drawVideoFrame(frame) {
   if (!calculator || !frame) return;
+  updateSourceThumb(frame);
   resizeOverlayToCalculator();
   drawOverlay.style.display = 'block';
   const bounds = calculator.graphpaperBounds;
@@ -2228,6 +2243,7 @@ function cancelMediaWork() {
   }
   videoFrames = [];
   videoFrameIndex = 0;
+  lastThumbFrame = null;
   videoTruncated = false;
   videoViewportInitialized = false;
   videoDesmosHidden = true;
@@ -2853,6 +2869,19 @@ async function preprocessVideoFrames(decodedMedia, generation) {
     : null;
   const frames = [];
   let firstPixelBeziers = null;
+  // 每帧缩略图(右下角"图 1. 原图"随播放同步):220px 宽 ImageData,~120 帧共 ~13MB,
+  // 换文件时随 videoFrames 一起被 GC。putImageData 不能缩放,所以经全尺寸临时
+  // canvas 中转一次 drawImage。
+  const thumbW = 220;
+  const thumbH = Math.max(1, Math.round(height / width * thumbW));
+  const thumbFull = document.createElement('canvas');
+  thumbFull.width = width; thumbFull.height = height;
+  const thumbFullCtx = thumbFull.getContext('2d');
+  const thumbSmall = document.createElement('canvas');
+  thumbSmall.width = thumbW; thumbSmall.height = thumbH;
+  const thumbSmallCtx = thumbSmall.getContext('2d');
+  thumbSmallCtx.imageSmoothingEnabled = true;
+  thumbSmallCtx.imageSmoothingQuality = 'medium';
   for (let i = 0; i < decoded.length; i++) {
     cancelledGeneration(generation);
     statsEl.textContent = '[+] 矢量化视频… ' + (i + 1) + '/' + decoded.length;
@@ -2866,7 +2895,10 @@ async function preprocessVideoFrames(decodedMedia, generation) {
       sharedPalette,
     });
     if (i === 0) firstPixelBeziers = result.beziers;
+    thumbFullCtx.putImageData(decoded[i], 0, 0);
+    thumbSmallCtx.drawImage(thumbFull, 0, 0, thumbW, thumbH);
     frames.push({
+      thumb: thumbSmallCtx.getImageData(0, 0, thumbW, thumbH),
       width,
       height,
       beziers: result.mathBeziers,
@@ -2880,8 +2912,7 @@ async function preprocessVideoFrames(decodedMedia, generation) {
   }
   cancelledGeneration(generation);
 
-  sourceCanvas.width = width; sourceCanvas.height = height;
-  sourceCanvas.getContext('2d').putImageData(decoded[0], 0, 0);
+  if (frames.length) updateSourceThumb(frames[0]);
   sourceSection.hidden = false;
   previewWrap.hidden = false;
   if (firstPixelBeziers) drawPreview(firstPixelBeziers, width, height);
