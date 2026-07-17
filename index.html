@@ -42,7 +42,7 @@
   #toolbar input[type="range"] { width: 90px; vertical-align: middle; accent-color: #201d1d; }
   #toolbar .val { color: #201d1d; font-variant-numeric: tabular-nums; }
 
-  #fileLabel, #renderBtn, #drawBtn, #videoPlayBtn, #fillToggleBtn, #fourierToggleBtn, #fineFillBtn, #paramsToggleBtn {
+  #fileLabel, #renderBtn, #drawBtn, #videoPlayBtn, #autoToggleBtn, #fillToggleBtn, #fourierToggleBtn, #fineFillBtn, #paramsToggleBtn {
     cursor: pointer; font-family: inherit;
     height: 36px; padding: 4px 20px;
     display: inline-flex; align-items: center;
@@ -56,10 +56,13 @@
   /* Toggle, not an action button: pressed (on) matches the solid primary
      style; unpressed (off) hollows out to signal "inactive" without a
      second color vocabulary. */
-  #fillToggleBtn, #fourierToggleBtn, #fineFillBtn, #paramsToggleBtn { border: 1px solid #201d1d; }
-  #fillToggleBtn[aria-pressed="false"], #fourierToggleBtn[aria-pressed="false"], #fineFillBtn[aria-pressed="false"] { background: #fdfcfc; color: #201d1d; }
-  #fillToggleBtn[aria-pressed="false"]:hover, #fourierToggleBtn[aria-pressed="false"]:hover, #fineFillBtn[aria-pressed="false"]:hover { background: rgba(32,29,29,0.06); }
-  #fillToggleBtn[aria-pressed="true"]:hover, #fourierToggleBtn[aria-pressed="true"]:hover, #fineFillBtn[aria-pressed="true"]:hover { background: #424245; }
+  #autoToggleBtn, #fillToggleBtn, #fourierToggleBtn, #fineFillBtn, #paramsToggleBtn { border: 1px solid #201d1d; }
+  #autoToggleBtn[aria-pressed="false"], #fillToggleBtn[aria-pressed="false"], #fourierToggleBtn[aria-pressed="false"], #fineFillBtn[aria-pressed="false"] { background: #fdfcfc; color: #201d1d; }
+  #autoToggleBtn[aria-pressed="false"]:hover, #fillToggleBtn[aria-pressed="false"]:hover, #fourierToggleBtn[aria-pressed="false"]:hover, #fineFillBtn[aria-pressed="false"]:hover { background: rgba(32,29,29,0.06); }
+  #autoToggleBtn[aria-pressed="true"]:hover, #fillToggleBtn[aria-pressed="true"]:hover, #fourierToggleBtn[aria-pressed="true"]:hover, #fineFillBtn[aria-pressed="true"]:hover { background: #424245; }
+  #toolbar label.auto-disabled { color: #9a9898; }
+  #toolbar input[type="range"]:disabled { opacity: 0.38; cursor: not-allowed; }
+  #fineFillBtn:disabled, #fineFillBtn:disabled:hover { background: #9a9898; border-color: #9a9898; color: #fdfcfc; cursor: not-allowed; opacity: 0.65; }
   #paramsToggleBtn { display: none; }
   #paramsToggleBtn[aria-expanded="false"] { background: #fdfcfc; color: #201d1d; }
   #paramsToggleBtn[aria-expanded="false"]:hover { background: rgba(32,29,29,0.06); }
@@ -191,6 +194,7 @@
     <span id="hint">[+] 拖入图片或视频即可</span>
 
     <button id="paramsToggleBtn" type="button" aria-expanded="false">[=] 参数</button>
+    <button id="autoToggleBtn" type="button" aria-pressed="true">[A] 自动</button>
     <div id="paramsDrawer">
       <label>阈值
         <input id="thresholdSlider" type="range" min="10" max="300" step="1" value="60">
@@ -325,6 +329,71 @@ function sobel(gray, width, height) {
     }
   }
   return { mag, dir };
+}
+
+function numericMedian(values) {
+  if (!values.length) return 0;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function autoRenderAnalysis(imageData) {
+  const { data, width, height } = imageData;
+  const gray = toGrayscale(data, width, height);
+  const magnitudes = sobel(gaussianBlur5(gray, width, height), width, height).mag;
+  const nonzero = [];
+  for (let i = 0; i < magnitudes.length; i++) {
+    if (magnitudes[i] > 1) nonzero.push(magnitudes[i]);
+  }
+  nonzero.sort((a, b) => a - b);
+  const percentileIndex = nonzero.length ? Math.ceil(nonzero.length * 0.7) - 1 : 0;
+  const high = Math.round(clamp(nonzero.length ? nonzero[percentileIndex] : 0, 30, 120));
+
+  // Fine-fill signal: fraction of sampled pixels that carry real color.
+  // A median over ALL pixels fails on the common white-background illustration
+  // (background majority drags the median to ~0 even when the subject is
+  // vividly colored — the fox demo reproduced this), so count colored pixels
+  // instead. Near-black pixels are excluded: at very low brightness the
+  // saturation ratio is dominated by sensor/JPEG noise.
+  let sampled = 0, colored = 0;
+  const pixelCount = width * height;
+  const stride = Math.max(1, Math.ceil(pixelCount / 4096));
+  for (let pixel = 0; pixel < pixelCount; pixel += stride) {
+    const offset = pixel * 4;
+    const r = data[offset] / 255;
+    const g = data[offset + 1] / 255;
+    const b = data[offset + 2] / 255;
+    const maxChannel = Math.max(r, g, b);
+    const minChannel = Math.min(r, g, b);
+    const saturation = maxChannel === 0 ? 0 : (maxChannel - minChannel) / maxChannel;
+    sampled++;
+    if (saturation >= 0.2 && maxChannel * 255 >= 30) colored++;
+  }
+  return { high, coloredFraction: sampled ? colored / sampled : 0 };
+}
+
+function autoRenderParams(imageData) {
+  const analysis = autoRenderAnalysis(imageData);
+  return {
+    high: analysis.high,
+    maxError: 1.0,
+    maxCurves: 8000,
+    fineFill: analysis.coloredFraction >= 0.05,
+  };
+}
+
+function lockAutoRenderAnalyses(analyses) {
+  return {
+    high: Math.round(numericMedian(analyses.map((analysis) => analysis.high))),
+    maxError: 1.0,
+    maxCurves: 8000,
+    fineFill: numericMedian(analyses.map((analysis) => analysis.coloredFraction)) >= 0.05,
+  };
+}
+
+function lockAutoRenderParams(frameImageDataList) {
+  return lockAutoRenderAnalyses(frameImageDataList.map(autoRenderAnalysis));
 }
 
 function sampleBilinear(mag, width, height, x, y) {
@@ -1988,6 +2057,7 @@ const previewHeader = document.getElementById('previewHeader');
 const previewMinimizeBtn = document.getElementById('previewMinimizeBtn');
 const paramsToggleBtn = document.getElementById('paramsToggleBtn');
 const paramsDrawer = document.getElementById('paramsDrawer');
+const autoToggleBtn = document.getElementById('autoToggleBtn');
 
 function setCurveCollapsed(collapsed) {
   curveSection.classList.toggle('collapsed', collapsed);
@@ -2095,6 +2165,65 @@ fineFillBtn.addEventListener('click', () => {
   fineFillEnabled = !fineFillEnabled;
   fineFillBtn.setAttribute('aria-pressed', String(fineFillEnabled));
 });
+
+let autoEnabled = true;
+let manualRenderParams = {
+  high: Number(thresholdSlider.value),
+  maxError: Number(toleranceSlider.value),
+  maxCurves: Number(maxCurvesSlider.value),
+  fineFill: fineFillEnabled,
+};
+let currentAutoRenderParams = { high: 60, maxError: 1.0, maxCurves: 8000, fineFill: false };
+
+function setRenderParamUi(params) {
+  thresholdSlider.value = String(params.high);
+  toleranceSlider.value = Number(params.maxError).toFixed(1);
+  maxCurvesSlider.value = String(params.maxCurves);
+  thresholdVal.textContent = thresholdSlider.value;
+  toleranceVal.textContent = Number(toleranceSlider.value).toFixed(1);
+  maxCurvesVal.textContent = maxCurvesSlider.value;
+  fineFillEnabled = params.fineFill;
+  fineFillBtn.setAttribute('aria-pressed', String(fineFillEnabled));
+}
+
+function setAutoControlsDisabled(disabled) {
+  for (const input of [thresholdSlider, toleranceSlider, maxCurvesSlider]) {
+    input.disabled = disabled;
+    input.closest('label').classList.toggle('auto-disabled', disabled);
+  }
+  fineFillBtn.disabled = disabled;
+}
+
+function applyAutoRenderParams(params) {
+  currentAutoRenderParams = params;
+  if (autoEnabled) setRenderParamUi(params);
+}
+
+function setAutoEnabled(enabled) {
+  if (enabled === autoEnabled) return;
+  if (enabled) {
+    manualRenderParams = {
+      high: Number(thresholdSlider.value),
+      maxError: Number(toleranceSlider.value),
+      maxCurves: Number(maxCurvesSlider.value),
+      fineFill: fineFillEnabled,
+    };
+    autoEnabled = true;
+    if (activeMediaKind === 'image' && currentImageData) {
+      currentAutoRenderParams = autoRenderParams(currentImageData);
+    }
+    setRenderParamUi(currentAutoRenderParams);
+  } else {
+    autoEnabled = false;
+    setRenderParamUi(manualRenderParams);
+  }
+  autoToggleBtn.setAttribute('aria-pressed', String(autoEnabled));
+  setAutoControlsDisabled(autoEnabled);
+}
+
+autoToggleBtn.addEventListener('click', () => setAutoEnabled(!autoEnabled));
+setRenderParamUi(currentAutoRenderParams);
+setAutoControlsDisabled(true);
 
 // Mode switch only takes effect on the next render() (same "change a slider,
 // re-render to apply" convention every other control already uses) -- see
@@ -3059,19 +3188,31 @@ async function decodeGifFrames(file, generation) {
 async function preprocessVideoFrames(media, generation) {
   const { frameCount, width, height } = media;
   let sharedPalette = null;
-  if (fillEnabled) {
+  const useAutoParams = autoEnabled;
+  let effectiveFineFillEnabled = fineFillEnabled;
+  if (fillEnabled || useAutoParams) {
     const paletteSources = [];
+    const autoFrameAnalyses = [];
     const paletteFrameCount = Math.min(12, frameCount);
     for (let i = 0; i < paletteFrameCount; i++) {
       const index = Math.min(frameCount - 1, Math.floor(i * frameCount / paletteFrameCount));
       statsEl.textContent = '[+] 分析色板… ' + (i + 1) + '/' + paletteFrameCount;
       const paletteFrame = await media.decodeFrame(index);
-      paletteSources.push(paletteFrame.data);
+      if (fillEnabled) paletteSources.push(paletteFrame.data);
+      if (useAutoParams) autoFrameAnalyses.push(autoRenderAnalysis(paletteFrame));
       await yieldToUI();
       cancelledGeneration(generation);
     }
-    sharedPalette = buildSharedPalette(paletteSources, fineFillEnabled ? 32 : 14, fineFillEnabled);
+    if (useAutoParams) {
+      const lockedParams = lockAutoRenderAnalyses(autoFrameAnalyses);
+      applyAutoRenderParams(lockedParams);
+      effectiveFineFillEnabled = lockedParams.fineFill;
+    }
+    if (fillEnabled) {
+      sharedPalette = buildSharedPalette(paletteSources, effectiveFineFillEnabled ? 32 : 14, effectiveFineFillEnabled);
+    }
     paletteSources.length = 0;
+    autoFrameAnalyses.length = 0;
     if (media.beginProcessingPass) await media.beginProcessingPass();
   }
   const frames = [];
@@ -3098,7 +3239,7 @@ async function preprocessVideoFrames(media, generation) {
       maxCurves: Number(maxCurvesSlider.value),
       mode: 'bezier',
       fillEnabled,
-      fineFillEnabled,
+      fineFillEnabled: effectiveFineFillEnabled,
       sharedPalette,
     });
     if (i === 0) firstPixelBeziers = result.beziers;
@@ -3180,6 +3321,7 @@ async function handleImageFile(file, generation) {
     }
     octx.drawImage(img, 0, 0, w, h);
     currentImageData = octx.getImageData(0, 0, w, h);
+    if (autoEnabled) applyAutoRenderParams(autoRenderParams(currentImageData));
     sourceCanvas.width = w;
     sourceCanvas.height = h;
     sourceCanvas.getContext('2d').drawImage(off, 0, 0);
