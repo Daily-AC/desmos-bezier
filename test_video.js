@@ -50,10 +50,60 @@ function makeCircleImageData(width, height) {
 }
 
 const {
-  vectorizeFrame, planVideoSamples, planGifSamples, advanceVideoPlayback, buildSharedPalette,
+  vectorizeFrame, scaledMediaSize, planVideoSamples, planGifSamples, advanceVideoPlayback, buildSharedPalette,
   assignPaletteLabels, extractFillPolygons,
 } = sandbox;
 check('vectorizeFrame is exported from the pure pipeline', typeof vectorizeFrame === 'function');
+
+const preprocessStart = html.indexOf('async function preprocessVideoFrames(');
+const preprocessEnd = html.indexOf('async function handleVideoFile(', preprocessStart);
+const preprocessSource = html.slice(preprocessStart, preprocessEnd);
+check('video palette pass is capped at 12 decoded frames', preprocessSource.includes('Math.min(12, frameCount)'));
+check('video processing pass decodes one current frame without a decoded-frame accumulator',
+  preprocessSource.includes('const frameImageData = await media.decodeFrame(i)') &&
+  !/\bdecoded\s*(?:=|\.push|\[)/.test(preprocessSource));
+check('streaming progress reports both palette and per-frame processing',
+  preprocessSource.includes('[+] 分析色板…') && preprocessSource.includes('[+] 处理视频…'));
+
+check('scaledMediaSize is exported', typeof scaledMediaSize === 'function');
+if (typeof scaledMediaSize === 'function') {
+  check('499px media upscales to 900px', JSON.stringify(scaledMediaSize(499, 300)) === JSON.stringify({ width: 900, height: 541, upscaled: true }), scaledMediaSize(499, 300));
+  check('500px media stays at source size', JSON.stringify(scaledMediaSize(500, 300)) === JSON.stringify({ width: 500, height: 300, upscaled: false }), scaledMediaSize(500, 300));
+  check('1000px media stays at source size', JSON.stringify(scaledMediaSize(1000, 600)) === JSON.stringify({ width: 1000, height: 600, upscaled: false }), scaledMediaSize(1000, 600));
+  check('1001px media downscales to 1000px', JSON.stringify(scaledMediaSize(1001, 501)) === JSON.stringify({ width: 1000, height: 500, upscaled: false }), scaledMediaSize(1001, 501));
+  check('720p media targets 1000px', JSON.stringify(scaledMediaSize(1280, 720)) === JSON.stringify({ width: 1000, height: 563, upscaled: false }), scaledMediaSize(1280, 720));
+  check('480x320 media targets 900px', JSON.stringify(scaledMediaSize(480, 320)) === JSON.stringify({ width: 900, height: 600, upscaled: true }), scaledMediaSize(480, 320));
+  check('600x338 media stays at source size', JSON.stringify(scaledMediaSize(600, 338)) === JSON.stringify({ width: 600, height: 338, upscaled: false }), scaledMediaSize(600, 338));
+
+  function legacyStaticImageSize(width, height) {
+    const maxDim = Math.max(width, height);
+    let w = width, h = height, upscaled = false;
+    if (maxDim > 1000) {
+      const scale = 1000 / maxDim;
+      w = Math.max(1, Math.round(w * scale));
+      h = Math.max(1, Math.round(h * scale));
+    } else if (maxDim < 500) {
+      upscaled = true;
+      const scale = 900 / maxDim;
+      w = Math.max(1, Math.round(w * scale));
+      h = Math.max(1, Math.round(h * scale));
+    }
+    return { width: w, height: h, upscaled };
+  }
+  let seed = 0x5eed1234;
+  let equivalent = true;
+  for (let i = 0; i < 10000; i++) {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    const width = seed % 10000 + 1;
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    const height = seed % 10000 + 1;
+    if (JSON.stringify(scaledMediaSize(width, height)) !== JSON.stringify(legacyStaticImageSize(width, height))) {
+      equivalent = false;
+      break;
+    }
+  }
+  check('shared sizing matches the legacy image calculation across 10000 dimensions', equivalent);
+}
 
 if (typeof vectorizeFrame === 'function') {
   const imageData = makeCircleImageData(96, 72);

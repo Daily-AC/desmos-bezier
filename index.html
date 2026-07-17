@@ -20,7 +20,7 @@
        face instead of an inconsistent system default. */
     font-family: "Berkeley Mono", "JetBrains Mono", "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace;
   }
-  body { display: flex; flex-direction: column; }
+  body { display: flex; flex-direction: column; height: 100%; height: 100dvh; }
 
   #toolbar {
     flex: 0 0 auto;
@@ -35,10 +35,14 @@
   #wordmark svg { display: block; }
   #controls { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
   #toolbar label { display: flex; align-items: center; gap: 6px; white-space: nowrap; color: #646262; }
+  /* #toolbar label's display:flex (author origin) beats the UA [hidden] rule,
+     so hidden-attribute toggles (容差/谐波数互斥) silently stop working without
+     this — same pitfall #videoControls[hidden] below already guards against. */
+  #toolbar label[hidden] { display: none; }
   #toolbar input[type="range"] { width: 90px; vertical-align: middle; accent-color: #201d1d; }
   #toolbar .val { color: #201d1d; font-variant-numeric: tabular-nums; }
 
-  #fileLabel, #renderBtn, #drawBtn, #videoPlayBtn, #fillToggleBtn, #fourierToggleBtn, #fineFillBtn {
+  #fileLabel, #renderBtn, #drawBtn, #videoPlayBtn, #fillToggleBtn, #fourierToggleBtn, #fineFillBtn, #paramsToggleBtn {
     cursor: pointer; font-family: inherit;
     height: 36px; padding: 4px 20px;
     display: inline-flex; align-items: center;
@@ -52,10 +56,15 @@
   /* Toggle, not an action button: pressed (on) matches the solid primary
      style; unpressed (off) hollows out to signal "inactive" without a
      second color vocabulary. */
-  #fillToggleBtn, #fourierToggleBtn, #fineFillBtn { border: 1px solid #201d1d; }
+  #fillToggleBtn, #fourierToggleBtn, #fineFillBtn, #paramsToggleBtn { border: 1px solid #201d1d; }
   #fillToggleBtn[aria-pressed="false"], #fourierToggleBtn[aria-pressed="false"], #fineFillBtn[aria-pressed="false"] { background: #fdfcfc; color: #201d1d; }
   #fillToggleBtn[aria-pressed="false"]:hover, #fourierToggleBtn[aria-pressed="false"]:hover, #fineFillBtn[aria-pressed="false"]:hover { background: rgba(32,29,29,0.06); }
   #fillToggleBtn[aria-pressed="true"]:hover, #fourierToggleBtn[aria-pressed="true"]:hover, #fineFillBtn[aria-pressed="true"]:hover { background: #424245; }
+  #paramsToggleBtn { display: none; }
+  #paramsToggleBtn[aria-expanded="false"] { background: #fdfcfc; color: #201d1d; }
+  #paramsToggleBtn[aria-expanded="false"]:hover { background: rgba(32,29,29,0.06); }
+  #paramsToggleBtn[aria-expanded="true"]:hover { background: #424245; }
+  #paramsDrawer { display: contents; }
 
   #hint { color: #9a9898; }
 
@@ -99,6 +108,18 @@
   }
   #previewWrap canvas { display: block; width: 100%; height: auto; background: #fdfcfc; }
   .previewCaption { font-size: 14px; color: #646262; padding: 6px 8px; }
+  #previewHeader {
+    display: flex; align-items: center; justify-content: space-between;
+    border-bottom: 1px solid rgba(15,0,0,0.12);
+    cursor: grab; touch-action: none; user-select: none;
+  }
+  #previewHeader.dragging { cursor: grabbing; }
+  #previewMinimizeBtn {
+    border: 0; border-radius: 0; padding: 0; margin: 0;
+    background: transparent; color: #646262;
+    cursor: pointer; font: inherit; line-height: 1;
+  }
+  #previewMinimizeBtn:hover { color: #201d1d; }
   /* hairline separators: canvas→caption inside source, section→section, caption→canvas inside curve */
   #sourceCanvas + .previewCaption { border-top: 1px solid rgba(15,0,0,0.12); }
   #sourceSection:not([hidden]) + #curveSection { border-top: 1px solid rgba(15,0,0,0.12); }
@@ -122,6 +143,41 @@
     width: 100%; height: 100%; object-fit: contain;
   }
   #previewWrap.large #desmosNotice { display: block; }
+  #previewWrap.large #previewHeader { display: none; }
+  #previewWrap.minimized > #desmosNotice,
+  #previewWrap.minimized > #sourceSection,
+  #previewWrap.minimized > #curveSection { display: none; }
+
+  @media (pointer: coarse) {
+    #toolbar button, #toolbar #fileLabel { min-height: 44px; touch-action: manipulation; }
+  }
+
+  @media (max-width: 720px) {
+    #toolbar { align-items: flex-start; gap: 8px; padding: 8px; }
+    #controls { flex: 1 1 100%; min-width: 0; width: 100%; gap: 8px; }
+    #hint { display: none; }
+    #paramsToggleBtn { display: inline-flex; }
+    #paramsDrawer {
+      display: none;
+      flex: 0 0 100%; flex-direction: column; gap: 4px;
+      width: 100%;
+    }
+    #paramsDrawer.open { display: flex; }
+    #paramsDrawer label {
+      width: 100%; min-height: 44px; gap: 10px;
+    }
+    #paramsDrawer label input[type="range"] {
+      flex: 1 1 auto; width: auto; min-width: 0;
+    }
+    #videoControls { flex: 1 1 100%; min-width: 0; gap: 8px; }
+    #videoControls label { flex: 1 1 auto; min-width: 0; }
+    #frameSlider { flex: 1 1 auto; width: auto; min-width: 80px; }
+    #stats {
+      flex: 0 0 100%; width: 100%; margin-left: 0;
+      white-space: normal; overflow-wrap: anywhere;
+    }
+    #previewWrap { width: min(220px, 48vw); }
+  }
 </style>
 </head>
 <body>
@@ -134,30 +190,33 @@
     </label>
     <span id="hint">[+] 拖入图片或视频即可</span>
 
-    <label>阈值
-      <input id="thresholdSlider" type="range" min="10" max="300" step="1" value="60">
-      <span class="val">[<span id="thresholdVal">60</span>]</span>
-    </label>
+    <button id="paramsToggleBtn" type="button" aria-expanded="false">[=] 参数</button>
+    <div id="paramsDrawer">
+      <label>阈值
+        <input id="thresholdSlider" type="range" min="10" max="300" step="1" value="60">
+        <span class="val">[<span id="thresholdVal">60</span>]</span>
+      </label>
 
-    <label id="toleranceLabel">容差
-      <input id="toleranceSlider" type="range" min="0.3" max="10" step="0.1" value="2.0">
-      <span class="val">[<span id="toleranceVal">2.0</span>]</span>
-    </label>
+      <label id="toleranceLabel">容差
+        <input id="toleranceSlider" type="range" min="0.3" max="10" step="0.1" value="2.0">
+        <span class="val">[<span id="toleranceVal">2.0</span>]</span>
+      </label>
 
-    <label id="harmonicsLabel" hidden>谐波数
-      <input id="harmonicsSlider" type="range" min="4" max="120" step="1" value="40">
-      <span class="val">[<span id="harmonicsVal">40</span>]</span>
-    </label>
+      <label id="harmonicsLabel" hidden>谐波数
+        <input id="harmonicsSlider" type="range" min="4" max="120" step="1" value="40">
+        <span class="val">[<span id="harmonicsVal">40</span>]</span>
+      </label>
 
-    <label>曲线上限
-      <input id="maxCurvesSlider" type="range" min="100" max="8000" step="100" value="4000">
-      <span class="val">[<span id="maxCurvesVal">4000</span>]</span>
-    </label>
+      <label>曲线上限
+        <input id="maxCurvesSlider" type="range" min="100" max="8000" step="100" value="4000">
+        <span class="val">[<span id="maxCurvesVal">4000</span>]</span>
+      </label>
 
-    <label>绘制速度
-      <input id="speedSlider" type="range" min="0.25" max="4" step="0.25" value="1">
-      <span class="val">[<span id="speedVal">1.0</span>x]</span>
-    </label>
+      <label>绘制速度
+        <input id="speedSlider" type="range" min="0.25" max="4" step="0.25" value="1">
+        <span class="val">[<span id="speedVal">1.0</span>x]</span>
+      </label>
+    </div>
 
     <button id="fillToggleBtn" aria-pressed="true">[*] 填色</button>
     <button id="fineFillBtn" aria-pressed="false">[#] 精细</button>
@@ -181,6 +240,10 @@
   <canvas id="drawOverlay"></canvas>
 
   <div id="previewWrap" hidden>
+    <div class="previewCaption" id="previewHeader">
+      <span>预览</span>
+      <button id="previewMinimizeBtn" type="button" aria-expanded="true">[-]</button>
+    </div>
     <div id="desmosNotice">[x] Desmos 加载失败(网络被拦截?)— 已切换到离线画布预览。</div>
     <div class="previewSection" id="sourceSection" hidden>
       <canvas id="sourceCanvas" width="220" height="150"></canvas>
@@ -857,6 +920,26 @@ function epicycleChain(dc, harmonics, t) {
  * of it.
  * ========================================================================= */
 
+// Shared by static images, HTML video, and GIF frames. Returning the upscale
+// decision separately keeps the browser-default resampler frozen for original
+// size/downscale draws while allowing high-quality smoothing for tiny sources.
+function scaledMediaSize(width, height) {
+  const maxDim = Math.max(width, height);
+  let scale = 1;
+  let upscaled = false;
+  if (maxDim > 1000) {
+    scale = 1000 / maxDim;
+  } else if (maxDim < 500) {
+    scale = 900 / maxDim;
+    upscaled = true;
+  }
+  return {
+    width: scale === 1 ? width : Math.max(1, Math.round(width * scale)),
+    height: scale === 1 ? height : Math.max(1, Math.round(height * scale)),
+    upscaled,
+  };
+}
+
 // Uniform leading-window sampling. HTMLVideoElement does not expose a
 // reliable source FPS, so time is the source of truth: sample at no more than
 // targetFps and stop after maxFrames. A capped plan intentionally represents
@@ -931,8 +1014,7 @@ function assignPaletteLabels(data, palette) {
 }
 
 // Build one palette from a bounded, evenly-spaced pixel sample across a frame
-// subset. The cap keeps memory stable even when 120 decoded 600px frames are
-// supplied; quantizeColors still performs the exact existing histogram merge.
+// subset. quantizeColors still performs the exact existing histogram merge.
 function buildSharedPalette(frameDataList, numColors, satAware, maxSamplePixels) {
   const frames = frameDataList.filter((data) => data && data.length >= 4);
   if (frames.length === 0) return [];
@@ -1901,6 +1983,11 @@ const sourceCanvas = document.getElementById('sourceCanvas');
 const curveSection = document.getElementById('curveSection');
 const curveCaption = document.getElementById('curveCaption');
 const curveMarker = document.getElementById('curveMarker');
+const mainEl = document.getElementById('main');
+const previewHeader = document.getElementById('previewHeader');
+const previewMinimizeBtn = document.getElementById('previewMinimizeBtn');
+const paramsToggleBtn = document.getElementById('paramsToggleBtn');
+const paramsDrawer = document.getElementById('paramsDrawer');
 
 function setCurveCollapsed(collapsed) {
   curveSection.classList.toggle('collapsed', collapsed);
@@ -1910,6 +1997,86 @@ function setCurveCollapsed(collapsed) {
 curveCaption.addEventListener('click', () => {
   setCurveCollapsed(!curveSection.classList.contains('collapsed'));
 });
+
+function setPreviewMinimized(minimized) {
+  previewWrap.classList.toggle('minimized', minimized);
+  previewMinimizeBtn.textContent = minimized ? '[+]' : '[-]';
+  previewMinimizeBtn.setAttribute('aria-expanded', String(!minimized));
+  if (!minimized) requestAnimationFrame(clampPreviewPosition);
+}
+
+previewMinimizeBtn.addEventListener('click', () => {
+  setPreviewMinimized(!previewWrap.classList.contains('minimized'));
+});
+
+paramsToggleBtn.addEventListener('click', () => {
+  const open = !paramsDrawer.classList.contains('open');
+  paramsDrawer.classList.toggle('open', open);
+  paramsToggleBtn.setAttribute('aria-expanded', String(open));
+});
+
+let previewDragging = false;
+let previewPointerId = null;
+let previewDragOffsetX = 0;
+let previewDragOffsetY = 0;
+
+function clampPreviewPosition() {
+  if (previewWrap.hidden || previewWrap.classList.contains('large') || previewWrap.style.left === '') return;
+  const mainRect = mainEl.getBoundingClientRect();
+  const maxLeft = Math.max(0, mainRect.width - previewWrap.offsetWidth);
+  const maxTop = Math.max(0, mainRect.height - previewWrap.offsetHeight);
+  const left = parseFloat(previewWrap.style.left);
+  const top = parseFloat(previewWrap.style.top);
+  previewWrap.style.left = clamp(Number.isFinite(left) ? left : 0, 0, maxLeft) + 'px';
+  previewWrap.style.top = clamp(Number.isFinite(top) ? top : 0, 0, maxTop) + 'px';
+}
+
+function endPreviewDrag(e) {
+  if (!previewDragging || (e.pointerId !== undefined && e.pointerId !== previewPointerId)) return;
+  previewDragging = false;
+  previewHeader.classList.remove('dragging');
+  if (previewHeader.hasPointerCapture(previewPointerId)) {
+    previewHeader.releasePointerCapture(previewPointerId);
+  }
+  previewPointerId = null;
+}
+
+previewHeader.addEventListener('pointerdown', (e) => {
+  if (previewWrap.classList.contains('large') ||
+      (e.target.closest && e.target.closest('#previewMinimizeBtn'))) return;
+
+  const mainRect = mainEl.getBoundingClientRect();
+  const previewRect = previewWrap.getBoundingClientRect();
+  previewWrap.style.right = 'auto';
+  previewWrap.style.bottom = 'auto';
+  previewWrap.style.left = (previewRect.left - mainRect.left) + 'px';
+  previewWrap.style.top = (previewRect.top - mainRect.top) + 'px';
+  previewDragOffsetX = e.clientX - previewRect.left;
+  previewDragOffsetY = e.clientY - previewRect.top;
+  previewPointerId = e.pointerId;
+  previewDragging = true;
+  previewHeader.classList.add('dragging');
+  previewHeader.setPointerCapture(e.pointerId);
+  e.preventDefault();
+});
+
+previewHeader.addEventListener('pointermove', (e) => {
+  if (!previewDragging || e.pointerId !== previewPointerId) return;
+  const mainRect = mainEl.getBoundingClientRect();
+  const maxLeft = Math.max(0, mainRect.width - previewWrap.offsetWidth);
+  const maxTop = Math.max(0, mainRect.height - previewWrap.offsetHeight);
+  const left = e.clientX - mainRect.left - previewDragOffsetX;
+  const top = e.clientY - mainRect.top - previewDragOffsetY;
+  previewWrap.style.left = clamp(left, 0, maxLeft) + 'px';
+  previewWrap.style.top = clamp(top, 0, maxTop) + 'px';
+  e.preventDefault();
+});
+
+previewHeader.addEventListener('pointerup', endPreviewDrag);
+previewHeader.addEventListener('pointercancel', endPreviewDrag);
+previewHeader.addEventListener('lostpointercapture', endPreviewDrag);
+window.addEventListener('resize', () => requestAnimationFrame(clampPreviewPosition));
+new ResizeObserver(clampPreviewPosition).observe(previewWrap);
 
 let currentImageData = null;
 let calculator = null;
@@ -1999,8 +2166,8 @@ let speedMultiplier = 1; // live-adjustable via the 绘制速度 slider; scales 
 let currentFourierPaths = [];
 const FOURIER_SAMPLE_COUNT = 240; // ink-trace resolution per path, independent of harmonic count
 
-// Video state stores vectors only after preprocessing. Decoded ImageData is
-// released once the shared palette and all vector frames have been produced.
+// Video state stores vectors and small thumbnails only. Full-size ImageData is
+// decoded on demand and released after the palette pass or current frame.
 let mediaGeneration = 0;
 let videoFrames = [];
 let videoFrameIndex = 0;
@@ -2711,14 +2878,6 @@ function cancelledGeneration(generation) {
   }
 }
 
-function scaledVideoSize(width, height) {
-  const scale = Math.min(1, 600 / Math.max(width, height));
-  return {
-    width: Math.max(1, Math.round(width * scale)),
-    height: Math.max(1, Math.round(height * scale)),
-  };
-}
-
 async function seekVideo(video, time, generation) {
   cancelledGeneration(generation);
   const target = Math.max(0, Math.min(time, Math.max(0, video.duration - 0.001)));
@@ -2742,136 +2901,183 @@ async function decodeHtmlVideoFrames(file, generation) {
   video.muted = true;
   video.preload = 'auto';
   video.playsInline = true;
-  activeMediaUrl = URL.createObjectURL(file);
-  video.src = activeMediaUrl;
-  await new Promise((resolve, reject) => {
-    video.addEventListener('loadedmetadata', resolve, { once: true });
-    video.addEventListener('error', () => reject(new Error('无法解码视频，请确认文件为 MP4 或 WebM')), { once: true });
+  const mediaUrl = URL.createObjectURL(file);
+  activeMediaUrl = mediaUrl;
+  video.src = mediaUrl;
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    URL.revokeObjectURL(mediaUrl);
+    if (activeMediaUrl === mediaUrl) activeMediaUrl = null;
+    video.removeAttribute('src');
     video.load();
-  });
-  cancelledGeneration(generation);
-  if (video.readyState < 2) {
+  };
+  try {
     await new Promise((resolve, reject) => {
-      video.addEventListener('loadeddata', resolve, { once: true });
-      video.addEventListener('error', () => reject(new Error('无法读取视频首帧')), { once: true });
+      video.addEventListener('loadedmetadata', resolve, { once: true });
+      video.addEventListener('error', () => reject(new Error('无法解码视频，请确认文件为 MP4 或 WebM')), { once: true });
+      video.load();
     });
     cancelledGeneration(generation);
+    if (video.readyState < 2) {
+      await new Promise((resolve, reject) => {
+        video.addEventListener('loadeddata', resolve, { once: true });
+        video.addEventListener('error', () => reject(new Error('无法读取视频首帧')), { once: true });
+      });
+      cancelledGeneration(generation);
+    }
+    if (!Number.isFinite(video.duration) || video.duration <= 0 || !video.videoWidth || !video.videoHeight) {
+      throw new Error('视频没有可用画面或时长');
+    }
+    const size = scaledMediaSize(video.videoWidth, video.videoHeight);
+    const canvas = document.createElement('canvas');
+    canvas.width = size.width; canvas.height = size.height;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (size.upscaled) {
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+    }
+    const plan = planVideoSamples(video.duration, 12, 120);
+    return {
+      frameCount: plan.times.length,
+      fps: plan.fps,
+      truncated: plan.truncated,
+      width: size.width,
+      height: size.height,
+      async decodeFrame(index) {
+        await seekVideo(video, plan.times[index], generation);
+        ctx.drawImage(video, 0, 0, size.width, size.height);
+        cancelledGeneration(generation);
+        return ctx.getImageData(0, 0, size.width, size.height);
+      },
+      close,
+    };
+  } catch (error) {
+    close();
+    throw error;
   }
-  if (!Number.isFinite(video.duration) || video.duration <= 0 || !video.videoWidth || !video.videoHeight) {
-    throw new Error('视频没有可用画面或时长');
-  }
-  const size = scaledVideoSize(video.videoWidth, video.videoHeight);
-  const canvas = document.createElement('canvas');
-  canvas.width = size.width; canvas.height = size.height;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  const plan = planVideoSamples(video.duration, 12, 120);
-  const decoded = [];
-  for (let i = 0; i < plan.times.length; i++) {
-    await seekVideo(video, plan.times[i], generation);
-    ctx.drawImage(video, 0, 0, size.width, size.height);
-    decoded.push(ctx.getImageData(0, 0, size.width, size.height));
-    statsEl.textContent = '[+] 解码视频… ' + (i + 1) + '/' + plan.times.length;
-    await yieldToUI();
-    cancelledGeneration(generation);
-  }
-  URL.revokeObjectURL(activeMediaUrl);
-  activeMediaUrl = null;
-  video.removeAttribute('src');
-  video.load();
-  return { decoded, fps: plan.fps, truncated: plan.truncated, width: size.width, height: size.height };
 }
 
 async function decodeGifFrames(file, generation) {
   if (typeof ImageDecoder === 'undefined') {
     throw new Error('当前浏览器不支持 GIF 动画解码（需要 Chromium ImageDecoder），请将 GIF 转为 MP4 后重试');
   }
-  const data = await file.arrayBuffer();
+  let data = await file.arrayBuffer();
   cancelledGeneration(generation);
   let decoder = new ImageDecoder({ data, type: 'image/gif' });
   activeImageDecoder = decoder;
-  await decoder.tracks.ready;
-  cancelledGeneration(generation);
-  const track = decoder.tracks.selectedTrack;
-  if (!track || !track.frameCount) throw new Error('GIF 没有可用动画帧');
-
-  const durationsUs = [];
-  let size = null;
-  let scanTruncated = false;
-  for (let sourceIndex = 0; sourceIndex < track.frameCount; sourceIndex++) {
-    const result = await decoder.decode({ frameIndex: sourceIndex, completeFramesOnly: true });
-    cancelledGeneration(generation);
-    const image = result.image;
-    if (!size) {
-      size = scaledVideoSize(image.displayWidth, image.displayHeight);
+  const close = () => {
+    if (decoder) {
+      try { decoder.close(); } catch (e) { /* already closed */ }
+      if (activeImageDecoder === decoder) activeImageDecoder = null;
+      decoder = null;
     }
-    const durationUs = Number.isFinite(image.duration) && image.duration > 0 ? image.duration : 100000;
-    durationsUs.push(durationUs);
-    image.close();
-    statsEl.textContent = '[+] 分析 GIF… ' + (sourceIndex + 1) + '/' + track.frameCount;
-    if (planGifSamples(durationsUs, 12, 120).indices.length >= 120) {
-      scanTruncated = sourceIndex < track.frameCount - 1;
-      break;
-    }
-    if (sourceIndex % 4 === 0) {
-      await yieldToUI();
-      cancelledGeneration(generation);
-    }
-  }
-  decoder.close();
-  cancelledGeneration(generation);
-
-  const plan = planGifSamples(durationsUs, 12, 120);
-  if (!plan.indices.length || !size) throw new Error('GIF 没有可用动画帧');
-  decoder = new ImageDecoder({ data, type: 'image/gif' });
-  activeImageDecoder = decoder;
-  await decoder.tracks.ready;
-  cancelledGeneration(generation);
-
-  const canvas = document.createElement('canvas');
-  canvas.width = size.width; canvas.height = size.height;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  const decoded = [];
-  for (let i = 0; i < plan.indices.length; i++) {
-    const result = await decoder.decode({ frameIndex: plan.indices[i], completeFramesOnly: true });
-    cancelledGeneration(generation);
-    const image = result.image;
-    ctx.clearRect(0, 0, size.width, size.height);
-    ctx.drawImage(image, 0, 0, size.width, size.height);
-    decoded.push(ctx.getImageData(0, 0, size.width, size.height));
-    image.close();
-    statsEl.textContent = '[+] 解码 GIF… ' + (i + 1) + '/' + plan.indices.length;
-    if (i % 4 === 0) {
-      await yieldToUI();
-      cancelledGeneration(generation);
-    }
-  }
-  decoder.close();
-  activeImageDecoder = null;
-  return {
-    decoded,
-    fps: 12,
-    truncated: scanTruncated || plan.truncated,
-    width: size.width,
-    height: size.height,
+    data = null;
   };
+  try {
+    await decoder.tracks.ready;
+    cancelledGeneration(generation);
+    const track = decoder.tracks.selectedTrack;
+    if (!track || !track.frameCount) throw new Error('GIF 没有可用动画帧');
+
+    const durationsUs = [];
+    let size = null;
+    let scanTruncated = false;
+    for (let sourceIndex = 0; sourceIndex < track.frameCount; sourceIndex++) {
+      const result = await decoder.decode({ frameIndex: sourceIndex, completeFramesOnly: true });
+      const image = result.image;
+      try {
+        cancelledGeneration(generation);
+        if (!size) size = scaledMediaSize(image.displayWidth, image.displayHeight);
+        const durationUs = Number.isFinite(image.duration) && image.duration > 0 ? image.duration : 100000;
+        durationsUs.push(durationUs);
+      } finally {
+        image.close();
+      }
+      statsEl.textContent = '[+] 分析 GIF… ' + (sourceIndex + 1) + '/' + track.frameCount;
+      if (planGifSamples(durationsUs, 12, 120).indices.length >= 120) {
+        scanTruncated = sourceIndex < track.frameCount - 1;
+        break;
+      }
+      await yieldToUI();
+      cancelledGeneration(generation);
+    }
+    decoder.close();
+    if (activeImageDecoder === decoder) activeImageDecoder = null;
+    decoder = null;
+    cancelledGeneration(generation);
+
+    const plan = planGifSamples(durationsUs, 12, 120);
+    if (!plan.indices.length || !size) throw new Error('GIF 没有可用动画帧');
+    decoder = new ImageDecoder({ data, type: 'image/gif' });
+    activeImageDecoder = decoder;
+    await decoder.tracks.ready;
+    cancelledGeneration(generation);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = size.width; canvas.height = size.height;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (size.upscaled) {
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+    }
+    return {
+      frameCount: plan.indices.length,
+      fps: 12,
+      truncated: scanTruncated || plan.truncated,
+      width: size.width,
+      height: size.height,
+      async decodeFrame(index) {
+        const result = await decoder.decode({ frameIndex: plan.indices[index], completeFramesOnly: true });
+        const image = result.image;
+        try {
+          cancelledGeneration(generation);
+          ctx.clearRect(0, 0, size.width, size.height);
+          ctx.drawImage(image, 0, 0, size.width, size.height);
+          return ctx.getImageData(0, 0, size.width, size.height);
+        } finally {
+          image.close();
+        }
+      },
+      async beginProcessingPass() {
+        decoder.close();
+        if (activeImageDecoder === decoder) activeImageDecoder = null;
+        decoder = new ImageDecoder({ data, type: 'image/gif' });
+        activeImageDecoder = decoder;
+        await decoder.tracks.ready;
+        cancelledGeneration(generation);
+      },
+      close,
+    };
+  } catch (error) {
+    close();
+    throw error;
+  }
 }
 
-async function preprocessVideoFrames(decodedMedia, generation) {
-  const { decoded, width, height } = decodedMedia;
-  const paletteSources = [];
-  const paletteFrameCount = Math.min(12, decoded.length);
-  for (let i = 0; i < paletteFrameCount; i++) {
-    const index = Math.min(decoded.length - 1, Math.floor(i * decoded.length / paletteFrameCount));
-    paletteSources.push(decoded[index].data);
+async function preprocessVideoFrames(media, generation) {
+  const { frameCount, width, height } = media;
+  let sharedPalette = null;
+  if (fillEnabled) {
+    const paletteSources = [];
+    const paletteFrameCount = Math.min(12, frameCount);
+    for (let i = 0; i < paletteFrameCount; i++) {
+      const index = Math.min(frameCount - 1, Math.floor(i * frameCount / paletteFrameCount));
+      statsEl.textContent = '[+] 分析色板… ' + (i + 1) + '/' + paletteFrameCount;
+      const paletteFrame = await media.decodeFrame(index);
+      paletteSources.push(paletteFrame.data);
+      await yieldToUI();
+      cancelledGeneration(generation);
+    }
+    sharedPalette = buildSharedPalette(paletteSources, fineFillEnabled ? 32 : 14, fineFillEnabled);
+    paletteSources.length = 0;
+    if (media.beginProcessingPass) await media.beginProcessingPass();
   }
-  const sharedPalette = fillEnabled
-    ? buildSharedPalette(paletteSources, fineFillEnabled ? 32 : 14, fineFillEnabled)
-    : null;
   const frames = [];
   let firstPixelBeziers = null;
-  // 每帧缩略图(右下角"图 1. 原图"随播放同步):220px 宽 ImageData,~120 帧共 ~13MB,
-  // 换文件时随 videoFrames 一起被 GC。putImageData 不能缩放,所以经全尺寸临时
-  // canvas 中转一次 drawImage。
+  // 每帧仅保留 220px 缩略图和矢量结果。全尺寸 ImageData 在当前循环完成后
+  // 即失去引用，不会随 frames 数组跨迭代累积。
   const thumbW = 220;
   const thumbH = Math.max(1, Math.round(height / width * thumbW));
   const thumbFull = document.createElement('canvas');
@@ -2882,10 +3088,11 @@ async function preprocessVideoFrames(decodedMedia, generation) {
   const thumbSmallCtx = thumbSmall.getContext('2d');
   thumbSmallCtx.imageSmoothingEnabled = true;
   thumbSmallCtx.imageSmoothingQuality = 'medium';
-  for (let i = 0; i < decoded.length; i++) {
+  for (let i = 0; i < frameCount; i++) {
     cancelledGeneration(generation);
-    statsEl.textContent = '[+] 矢量化视频… ' + (i + 1) + '/' + decoded.length;
-    const result = vectorizeFrame(decoded[i], {
+    statsEl.textContent = '[+] 处理视频… ' + (i + 1) + '/' + frameCount;
+    const frameImageData = await media.decodeFrame(i);
+    const result = vectorizeFrame(frameImageData, {
       high: Number(thresholdSlider.value),
       maxError: Number(toleranceSlider.value),
       maxCurves: Number(maxCurvesSlider.value),
@@ -2895,7 +3102,7 @@ async function preprocessVideoFrames(decodedMedia, generation) {
       sharedPalette,
     });
     if (i === 0) firstPixelBeziers = result.beziers;
-    thumbFullCtx.putImageData(decoded[i], 0, 0);
+    thumbFullCtx.putImageData(frameImageData, 0, 0);
     thumbSmallCtx.drawImage(thumbFull, 0, 0, thumbW, thumbH);
     frames.push({
       thumb: thumbSmallCtx.getImageData(0, 0, thumbW, thumbH),
@@ -2928,8 +3135,13 @@ async function handleVideoFile(file, generation, isGif) {
   const decodedMedia = isGif
     ? await decodeGifFrames(file, generation)
     : await decodeHtmlVideoFrames(file, generation);
-  cancelledGeneration(generation);
-  const frames = await preprocessVideoFrames(decodedMedia, generation);
+  let frames;
+  try {
+    cancelledGeneration(generation);
+    frames = await preprocessVideoFrames(decodedMedia, generation);
+  } finally {
+    decodedMedia.close();
+  }
   cancelledGeneration(generation);
 
   videoFrames = frames;
@@ -2952,28 +3164,13 @@ async function handleImageFile(file, generation) {
   try {
     const img = await loadImageFile(file);
     cancelledGeneration(generation);
-    let w = img.naturalWidth, h = img.naturalHeight;
-    if (w === 0 || h === 0) throw new Error('Image has no pixels');
-    const maxDim = Math.max(w, h);
-    let upscaled = false;
-    if (maxDim > 1000) {
-      const scale = 1000 / maxDim;
-      w = Math.max(1, Math.round(w * scale));
-      h = Math.max(1, Math.round(h * scale));
-    } else if (maxDim < 500) {
-      upscaled = true;
-      // Tiny sources (small downloaded portraits): upscale so edge tracing and
-      // fill boundaries work at sub-source-pixel smoothness instead of
-      // staircasing. Gate at 500 keeps every existing test asset (>=600px)
-      // byte-identical through the pipeline.
-      const scale = 900 / maxDim;
-      w = Math.max(1, Math.round(w * scale));
-      h = Math.max(1, Math.round(h * scale));
-    }
+    if (img.naturalWidth === 0 || img.naturalHeight === 0) throw new Error('Image has no pixels');
+    const size = scaledMediaSize(img.naturalWidth, img.naturalHeight);
+    const w = size.width, h = size.height;
     const off = document.createElement('canvas');
     off.width = w; off.height = h;
     const octx = off.getContext('2d');
-    if (upscaled) {
+    if (size.upscaled) {
       // High-quality resampling ONLY for the upscale branch. Setting it
       // unconditionally changes the downscale path's pixel output and shifted
       // every baseline curve count (caught by the regression suite) -- the
@@ -3275,8 +3472,23 @@ function waitForDesmos(timeoutMs) {
   });
 }
 
+function clearPreviewPosition() {
+  if (previewDragging && previewPointerId !== null && previewHeader.hasPointerCapture(previewPointerId)) {
+    previewHeader.releasePointerCapture(previewPointerId);
+  }
+  previewDragging = false;
+  previewPointerId = null;
+  previewHeader.classList.remove('dragging');
+  previewWrap.style.left = '';
+  previewWrap.style.top = '';
+  previewWrap.style.right = '';
+  previewWrap.style.bottom = '';
+}
+
 function showDesmosFailureNotice() {
   document.getElementById('calculator').style.display = 'none';
+  clearPreviewPosition();
+  setPreviewMinimized(false);
   previewWrap.classList.add('large');
   previewWrap.hidden = false;
   setCurveCollapsed(false);
